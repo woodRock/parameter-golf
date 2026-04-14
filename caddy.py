@@ -12,8 +12,11 @@ from rich.prompt import Prompt, IntPrompt
 
 console = Console()
 
+# Find the project root (where this script lives)
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
 def get_leaderboard():
-    readme_path = Path("README.md")
+    readme_path = PROJECT_ROOT / "README.md"
     if not readme_path.exists():
         return []
     
@@ -32,7 +35,7 @@ def get_leaderboard():
     return rows[:10]
 
 def list_experiments():
-    base_dir = Path("records/track_10min_16mb")
+    base_dir = PROJECT_ROOT / "records" / "track_10min_16mb"
     if not base_dir.exists():
         return []
     
@@ -82,9 +85,9 @@ def show_main_menu():
 def launch_experiment(exp):
     console.print(Panel(f"🚀 Preparing to launch: [bold green]{exp['name']}[/bold green]"))
     
-    # Default parameters
-    data_path = "../../../data/datasets/fineweb10B_sp1024/"
-    token_path = "../../../data/tokenizers/fineweb_1024_bpe.model"
+    # Use absolute paths for the run
+    data_path = (PROJECT_ROOT / "data" / "datasets" / "fineweb10B_sp1024").resolve()
+    token_path = (PROJECT_ROOT / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve()
     vocab_size = "1024"
     
     # Create the command
@@ -95,8 +98,8 @@ def launch_experiment(exp):
     env_vars = {
         "RUN_ID": exp['name'],
         "WANDB_ENABLED": "1",
-        "DATA_PATH": data_path,
-        "TOKENIZER_PATH": token_path,
+        "DATA_PATH": str(data_path),
+        "TOKENIZER_PATH": str(token_path),
         "VOCAB_SIZE": vocab_size
     }
     
