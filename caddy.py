@@ -52,7 +52,7 @@ def get_bpb_from_logs(exp_path):
     latest_log = max(log_files, key=lambda x: x.stat().st_mtime)
     try:
         content = latest_log.read_text()
-        # Look for the last final_int8_zlib_roundtrip or val_bpb entry
+        # Look for the last val_bpb entry (various formats)
         matches = re.findall(r"val_bpb:(\d+\.\d+)", content)
         if matches:
             return matches[-1]
@@ -61,7 +61,6 @@ def get_bpb_from_logs(exp_path):
 
 def is_my_experiment(path):
     try:
-        # Check if the directory was created/touched by woodRock in git
         res = subprocess.run(
             ["git", "log", "--format=%an", "-n", "1", "--", str(path)],
             cwd=PROJECT_ROOT, capture_output=True, text=True
@@ -77,13 +76,14 @@ def list_experiments():
     
     my_exps = []
     others = []
+    today = "2026-04-14"
     
     for track in records_dir.iterdir():
         if track.is_dir():
             for d in track.iterdir():
                 if d.is_dir():
                     info = {"name": d.name, "path": d, "bpb": get_bpb_from_logs(d)}
-                    if is_my_experiment(d) or "2026-04-14" in d.name:
+                    if d.name.startswith(today) or is_my_experiment(d):
                         my_exps.append(info)
                     else:
                         others.append(info)
@@ -92,35 +92,44 @@ def list_experiments():
     others.sort(key=lambda x: x["name"], reverse=True)
     return my_exps, others
 
-def show_main_menu():
+def show_main_menu(show_global=False):
     console.clear()
     console.print(f"[bold green]⛳ GOLF CADDY[/bold green] [dim]| {PROJECT_ROOT}[/dim]", justify="center")
     
     my_exps, others = list_experiments()
     
-    # Create side-by-side or stacked tables
-    table = Table(box=None, padding=(0, 2))
-    table.add_column("Your Experiments", style="bold green")
-    table.add_column("Global SOTA", style="bold yellow")
-    
-    # Local Table
-    local_t = Table(border_style="green", header_style="bold green", x_ratio=None)
-    local_t.add_column("#", style="dim", width=2)
-    local_t.add_column("Experiment", width=30)
-    local_t.add_column("BPB", justify="right")
-    for i, exp in enumerate(my_exps[:15]):
-        local_t.add_row(str(i+1), exp["name"], str(exp["bpb"]))
+    if not show_global:
+        # User View
+        table = Table(title="🧪 Your Experiments", border_style="green", header_style="bold green")
+        table.add_column("#", style="dim", width=2)
+        table.add_column("Experiment ID", width=50)
+        table.add_column("Latest BPB", justify="right")
         
-    # SOTA Table (from README)
-    sota_t = Table(border_style="yellow", header_style="bold yellow")
-    sota_t.add_column("Run", width=30)
-    sota_t.add_column("BPB", justify="right")
-    lb = get_leaderboard()
-    for row in lb[:10]:
-        sota_t.add_row(row[0][:30], row[1])
+        for i, exp in enumerate(my_exps):
+            table.add_row(str(i+1), exp["name"], str(exp["bpb"]))
+        console.print(table, justify="center")
         
-    console.print(local_t, sota_t, justify="center")
-    console.print("\n [bold cyan][1-N][/bold cyan] Launch   [bold yellow][R][/bold yellow] Refresh   [bold red][Q][/bold red] Quit", justify="center")
+        # Mini Leaderboard
+        lb_table = Table(title="🏆 Top 5 to Beat", border_style="yellow")
+        lb_table.add_column("Run", width=40)
+        lb_table.add_column("BPB", justify="right")
+        lb = get_leaderboard()
+        for row in lb[:5]:
+            lb_table.add_row(row[0], row[1])
+        console.print(lb_table, justify="center")
+        
+        console.print("\n [bold cyan][1-N][/bold cyan] Launch   [bold yellow][G][/bold yellow] Show All Records   [bold yellow][R][/bold yellow] Refresh   [bold red][Q][/bold red] Quit", justify="center")
+    else:
+        # Global View
+        table = Table(title="🌍 All Competition Records", border_style="blue", header_style="bold blue")
+        table.add_column("#", style="dim", width=2)
+        table.add_column("Record ID", width=50)
+        table.add_column("BPB", justify="right")
+        
+        for i, exp in enumerate(others):
+            table.add_row(str(i+1), exp["name"], str(exp["bpb"]))
+        console.print(table, justify="center")
+        console.print("\n [bold yellow][B][/bold yellow] Back to My Experiments   [bold red][Q][/bold red] Quit", justify="center")
 
 def launch_experiment(exp):
     console.print(Panel(f"🚀 Preparing to launch: [bold green]{exp['name']}[/bold green]"))
@@ -130,10 +139,7 @@ def launch_experiment(exp):
     token_path = (PROJECT_ROOT / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve()
     vocab_size = "1024"
     
-    # Create the command
-    run_cmd = (
-        f"ts -G 2 torchrun --standalone --nproc_per_node=2 train_gpt.py"
-    )
+    run_cmd = f"ts -G 2 torchrun --standalone --nproc_per_node=2 train_gpt.py"
     
     env_vars = {
         "RUN_ID": exp['name'],
@@ -151,32 +157,37 @@ def launch_experiment(exp):
     
     confirm = Prompt.ask("\nLaunch this task?", choices=["y", "n"], default="y")
     if confirm == "y":
-        # Execute in the directory of the experiment
         env_str = " ".join([f"{k}={v}" for k, v in env_vars.items()])
         full_cmd = f"cd {exp['path']} && {env_str} {run_cmd}"
         
         try:
             subprocess.run(full_cmd, shell=True, check=True)
-            console.print("\n[bold green]✅ Task Spooled![/bold green] (Check `ts` for status)")
+            console.print("\n[bold green]✅ Task Spooled![/bold green]")
         except Exception as e:
-            console.print(f"\n[bold red]❌ Failed to spool task:[/bold red] {e}")
+            console.print(f"\n[bold red]❌ Error:[/bold red] {e}")
     
-    input("\nPress Enter to return to menu...")
+    input("\nPress Enter to return...")
 
 def main():
+    show_global = False
     while True:
-        show_main_menu()
-        choice = Prompt.ask("\n[bold cyan]Choose an action[/bold cyan]").lower()
+        show_main_menu(show_global)
+        choice = Prompt.ask("\n[bold cyan]Action[/bold cyan]").lower()
         
         if choice == 'q':
             break
         elif choice == 'r':
             continue
+        elif choice == 'g':
+            show_global = True
+        elif choice == 'b':
+            show_global = False
         elif choice.isdigit():
             idx = int(choice) - 1
             my_exps, others = list_experiments()
-            if 0 <= idx < len(my_exps):
-                launch_experiment(my_exps[idx])
+            target_list = others if show_global else my_exps
+            if 0 <= idx < len(target_list):
+                launch_experiment(target_list[idx])
             else:
                 console.print("[bold red]Invalid index![/bold red]")
                 time.sleep(1)
