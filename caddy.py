@@ -169,11 +169,19 @@ def launch_experiment(exp):
         input("\nPress Enter to return...")
         return
 
-    run_cmd = f"task -G 2 -m 80 bash -c 'export WANDB_ENABLED=1 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node=2 train_gpt.py'"
+    # Detect TTT
+    is_ttt = "TTT" in exp['name']
+    ttt_flag = "1" if is_ttt else "0"
+    
+    # Use 1 GPU and lower memory requirement to fit more servers
+    num_gpus = 1
+    min_mem = 24 # Fits single A10/RTX 3090/RTX 6000
+    
+    run_cmd = f"task -G {num_gpus} -m {min_mem} bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node={num_gpus} train_gpt.py'"
     
     console.print(f"\n[bold white]Variant Config:[/bold white]")
-    console.print(f"  Tokenizer: [cyan]{variant}[/cyan]")
-    console.print(f"  Vocab Size: [cyan]{vocab_size}[/cyan]")
+    console.print(f"  Tokenizer: [cyan]{variant}[/cyan]  Vocab: [cyan]{vocab_size}[/cyan]  TTT: [cyan]{'Enabled' if is_ttt else 'Disabled'}[/cyan]")
+    console.print(f"  Hardware: [cyan]{num_gpus} GPU[/cyan]  Min-Mem: [cyan]{min_mem}GB[/cyan]")
     
     console.print(f"\n[bold white]Command:[/bold white]\n  {run_cmd}")
     
