@@ -39,10 +39,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -60,12 +60,12 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
-    model_dim = int(os.environ.get("MODEL_DIM", 640)) # Increased for 1024-vocab
-    num_heads = int(os.environ.get("NUM_HEADS", 10)) 
-    mlp_mult = int(os.environ.get("MLP_MULT", 3)) # Adjusted for balance
+    model_dim = int(os.environ.get("MODEL_DIM", 640)) 
+    num_heads = int(os.environ.get("NUM_HEADS", 10))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3)) 
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -268,6 +268,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    **kwargs,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -330,6 +331,9 @@ def eval_val_ttt(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    max_wallclock_ms: float | None = None,
+    t0: float | None = None,
+    training_time_ms: float = 0.0,
 ) -> tuple[float, float]:
     # Legal Score-First TTT
     # 1. Divide val tokens into chunks
@@ -350,6 +354,15 @@ def eval_val_ttt(
     optimizer = torch.optim.SGD(model.parameters(), lr=args.ttt_lr, momentum=0.9)
     
     for chunk_idx in range(num_chunks):
+        # Check wallclock limit
+        if max_wallclock_ms is not None and t0 is not None:
+            torch.cuda.synchronize()
+            current_total_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            if current_total_ms >= max_wallclock_ms:
+                if rank == 0:
+                    print(f"TTT early stop at chunk {chunk_idx}/{num_chunks} due to wallclock cap")
+                break
+
         start_pos = chunk_idx * chunk_size
         end_pos = min(start_pos + chunk_size, total_tokens)
         chunk_tokens = val_tokens[start_pos : end_pos + 1].to(device=device, dtype=torch.int64)
@@ -1286,6 +1299,9 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        max_wallclock_ms=max_wallclock_ms,
+        t0=t0,
+        training_time_ms=training_time_ms,
     )
     torch.cuda.synchronize()
     log0(

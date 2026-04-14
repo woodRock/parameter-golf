@@ -236,6 +236,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    **kwargs,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -298,6 +299,9 @@ def eval_val_ttt(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    max_wallclock_ms: float | None = None,
+    t0: float | None = None,
+    training_time_ms: float = 0.0,
 ) -> tuple[float, float]:
     # Legal Score-First TTT
     # 1. Divide val tokens into chunks
@@ -318,6 +322,15 @@ def eval_val_ttt(
     optimizer = torch.optim.SGD(model.parameters(), lr=args.ttt_lr, momentum=0.9)
     
     for chunk_idx in range(num_chunks):
+        # Check wallclock limit
+        if max_wallclock_ms is not None and t0 is not None:
+            torch.cuda.synchronize()
+            current_total_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            if current_total_ms >= max_wallclock_ms:
+                if rank == 0:
+                    print(f"TTT early stop at chunk {chunk_idx}/{num_chunks} due to wallclock cap")
+                break
+
         start_pos = chunk_idx * chunk_size
         end_pos = min(start_pos + chunk_size, total_tokens)
         chunk_tokens = val_tokens[start_pos : end_pos + 1].to(device=device, dtype=torch.int64)
@@ -1230,6 +1243,9 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        max_wallclock_ms=max_wallclock_ms,
+        t0=t0,
+        training_time_ms=training_time_ms,
     )
     torch.cuda.synchronize()
     log0(
