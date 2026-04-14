@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import time
 import subprocess
 from pathlib import Path
 from rich.console import Console
@@ -40,9 +41,8 @@ def list_experiments():
         return []
     
     experiments = []
-    for d in sorted(base_dir.iterdir()):
+    for d in sorted(base_dir.iterdir(), reverse=True):
         if d.is_dir():
-            # Check for submission.json for metadata
             sub_json = d / "submission.json"
             bpb = "N/A"
             if sub_json.exists():
