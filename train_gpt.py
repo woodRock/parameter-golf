@@ -502,6 +502,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
 
+    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
