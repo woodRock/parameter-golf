@@ -77,8 +77,9 @@ def get_bpb_from_logs(exp_path):
 
 def is_my_experiment(path):
     try:
+        # Check the FIRST author of the directory to see who created it
         res = subprocess.run(
-            ["git", "log", "--format=%an", "-n", "1", "--", str(path)],
+            ["git", "log", "--reverse", "--format=%an", "-n", "1", "--", str(path)],
             cwd=PROJECT_ROOT, capture_output=True, text=True
         )
         return "woodRock" in res.stdout
