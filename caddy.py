@@ -120,10 +120,6 @@ class CaddyApp(App):
         height: 1;
     }
 
-    #main-container {
-        height: 1fr;
-    }
-
     DataTable {
         height: 1fr;
         width: 100%;
@@ -139,17 +135,6 @@ class CaddyApp(App):
         padding: 0 1;
     }
 
-    #left-pane {
-        width: 1fr;
-        height: 100%;
-        border-right: solid $primary;
-    }
-
-    #right-pane {
-        width: 1fr;
-        height: 100%;
-    }
-
     TabPane {
         padding: 0;
         height: 1fr;
@@ -162,14 +147,6 @@ class CaddyApp(App):
     Footer {
         background: $surface;
         color: $text;
-    }
-
-    .status-running {
-        color: $success;
-    }
-
-    .status-queued {
-        color: $warning;
     }
     """
 
@@ -196,17 +173,15 @@ class CaddyApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Label(f"⛳ GOLF CADDY | {PROJECT_ROOT}", id="header-title")
-        with Horizontal(id="main-container"):
-            with Vertical(id="left-pane"):
-                with TabbedContent(id="tabs"):
-                    with TabPane("🧪 Experiments", id="tab-exps"):
-                        yield Label("Your Experiments", id="exp-title", classes="title-label")
-                        yield DataTable(id="exp-table")
-                    with TabPane("📡 Active Tasks", id="tab-tasks"):
-                        yield Label("Running & Queued Tasks", classes="title-label")
-                        yield DataTable(id="task-table")
-            with Vertical(id="right-pane"):
-                yield Label("🏆 Global Leaderboard", classes="title-label")
+        with TabbedContent(id="tabs"):
+            with TabPane("🧪 Experiments", id="tab-exps"):
+                yield Label("Your Experiments", id="exp-title", classes="title-label")
+                yield DataTable(id="exp-table")
+            with TabPane("📡 Active Tasks", id="tab-tasks"):
+                yield Label("Running & Queued Tasks", classes="title-label")
+                yield DataTable(id="task-table")
+            with TabPane("🏆 Leaderboard", id="tab-leaderboard"):
+                yield Label("Global Leaderboard", classes="title-label")
                 yield DataTable(id="leaderboard-table")
         yield Footer()
 
@@ -222,16 +197,28 @@ class CaddyApp(App):
             self.query_one("#exp-table").focus()
         elif event.pane.id == "tab-tasks":
             self.query_one("#task-table").focus()
+        elif event.pane.id == "tab-leaderboard":
+            self.query_one("#leaderboard-table").focus()
 
     def action_next_tab(self) -> None:
         tabs = self.query_one(TabbedContent)
-        if tabs.active == "tab-exps":
-            tabs.active = "tab-tasks"
-        else:
+        tab_ids = ["tab-exps", "tab-tasks", "tab-leaderboard"]
+        try:
+            curr_idx = tab_ids.index(tabs.active)
+            next_idx = (curr_idx + 1) % len(tab_ids)
+            tabs.active = tab_ids[next_idx]
+        except ValueError:
             tabs.active = "tab-exps"
 
     def action_prev_tab(self) -> None:
-        self.action_next_tab()
+        tabs = self.query_one(TabbedContent)
+        tab_ids = ["tab-exps", "tab-tasks", "tab-leaderboard"]
+        try:
+            curr_idx = tab_ids.index(tabs.active)
+            prev_idx = (curr_idx - 1) % len(tab_ids)
+            tabs.active = tab_ids[prev_idx]
+        except ValueError:
+            tabs.active = "tab-exps"
 
     def setup_tables(self):
         exp_table = self.query_one("#exp-table", DataTable)
@@ -254,31 +241,35 @@ class CaddyApp(App):
 
     def refresh_tasks(self) -> None:
         self.tasks = get_running_tasks()
-        task_table = self.query_one("#task-table", DataTable)
-        task_table.clear()
-        for t in self.tasks:
-            status_style = "[bold green]" if t["status"] == "running" else "[yellow]"
-            task_table.add_row(
-                t["id"],
-                f"{status_style}{t['status']}[/]",
-                t["runtime"],
-                t["label"]
-            )
+        try:
+            task_table = self.query_one("#task-table", DataTable)
+            task_table.clear()
+            for t in self.tasks:
+                status_style = "[bold green]" if t["status"] == "running" else "[yellow]"
+                task_table.add_row(
+                    t["id"],
+                    f"{status_style}{t['status']}[/]",
+                    t["runtime"],
+                    t["label"]
+                )
+        except: pass
 
     def update_tables(self) -> None:
         target_list = self.others if self.show_global else self.my_exps
         title = "🌍 All Competition Records" if self.show_global else "🧪 Your Experiments"
-        self.query_one("#exp-title", Label).update(title)
-        
-        exp_table = self.query_one("#exp-table", DataTable)
-        exp_table.clear()
-        for exp in target_list:
-            exp_table.add_row(str(exp["bpb"]), exp["name"])
+        try:
+            self.query_one("#exp-title", Label).update(title)
+            
+            exp_table = self.query_one("#exp-table", DataTable)
+            exp_table.clear()
+            for exp in target_list:
+                exp_table.add_row(str(exp["bpb"]), exp["name"])
 
-        lb_table = self.query_one("#leaderboard-table", DataTable)
-        lb_table.clear()
-        for row in self.leaderboard:
-            lb_table.add_row(row[1], row[0])
+            lb_table = self.query_one("#leaderboard-table", DataTable)
+            lb_table.clear()
+            for row in self.leaderboard:
+                lb_table.add_row(row[1], row[0])
+        except: pass
 
     def action_toggle_global(self) -> None:
         self.show_global = not self.show_global
@@ -297,8 +288,9 @@ class CaddyApp(App):
                 if cursor_row < len(target_list):
                     self.launch_experiment(target_list[cursor_row])
         elif active_tab == "tab-tasks":
-            # Potentially add task cancellation or logs here
             self.notify("Task management coming soon!", severity="info")
+        elif active_tab == "tab-leaderboard":
+            self.notify("Leaderboard is read-only.", severity="info")
 
     def launch_experiment(self, exp):
         is_sp8192 = "SP8192" in exp['name']
@@ -315,10 +307,7 @@ class CaddyApp(App):
         is_ttt = "TTT" in exp['name']
         ttt_flag = "1" if is_ttt else "0"
         
-        # Original script logic for experiment launching
         run_cmd = f"bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export MAX_WALLCLOCK_SECONDS=4800 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node=1 train_gpt.py --wallclock 4800'"
-        
-        # Wrap in task command as requested: task -G 1 -m 45 -n <label> <script>
         task_cmd = f"task -G 1 -m 45 -n {exp['name']} {run_cmd}"
         
         def run_it():
