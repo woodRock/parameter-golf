@@ -45,8 +45,11 @@ def get_bpb_from_logs(exp_path):
 
     # Try the experiment directory first (recursively), then the global logs directory
     # Filter out non-log files like requirements.txt
-    log_files = [f for f in (list(exp_path.rglob("*.txt")) + list(exp_path.rglob("*.log"))) 
-                 if f.name not in ("requirements.txt", "README.md")]
+    all_files = list(exp_path.rglob("*"))
+    txt_files = [f for f in all_files if f.suffix == ".txt"]
+    log_files_list = [f for f in all_files if f.suffix == ".log"]
+    log_files = [f for f in (txt_files + log_files_list) 
+                 if f.name not in ("requirements.txt", "README.md", "submission.json")]
 
     # Also check the global logs folder for a file named after the experiment
     global_log = PROJECT_ROOT / "logs" / f"{exp_path.name}.txt"
@@ -57,6 +60,10 @@ def get_bpb_from_logs(exp_path):
     exp_logs_dir = exp_path / "logs"
     if exp_logs_dir.exists():
         log_files.extend([f for f in exp_logs_dir.rglob("*") if f.is_file() and f.suffix in (".txt", ".log")])
+
+    # Debug output for today's experiments
+    if exp_path.name.startswith("2026-04-14"):
+        console.print(f"[cyan]Debug {exp_path.name}: found {len(log_files)} log file(s): {[f.name for f in log_files]}[/cyan]")
 
     if not log_files:
         # Debug: print when no log files found
