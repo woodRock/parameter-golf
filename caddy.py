@@ -43,8 +43,8 @@ def get_bpb_from_logs(exp_path):
             return json.loads(sub_json.read_text()).get("val_bpb", "N/A")
         except: pass
     
-    # Try the experiment directory first, then the global logs directory
-    log_files = list(exp_path.glob("*.txt")) + list(exp_path.glob("*.log"))
+    # Try the experiment directory first (recursively), then the global logs directory
+    log_files = list(exp_path.rglob("*.txt")) + list(exp_path.rglob("*.log"))
     
     # Also check the global logs folder for a file named after the experiment
     global_log = PROJECT_ROOT / "logs" / f"{exp_path.name}.txt"
