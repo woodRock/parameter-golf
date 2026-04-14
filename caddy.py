@@ -155,7 +155,7 @@ def launch_experiment(exp):
     token_path = (PROJECT_ROOT / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve()
     vocab_size = "1024"
     
-    run_cmd = f"ts -G 2 torchrun --standalone --nproc_per_node=2 train_gpt.py"
+    run_cmd = f"task -G 2 torchrun --standalone --nproc_per_node=2 train_gpt.py"
     
     env_vars = {
         "RUN_ID": exp['name'],
