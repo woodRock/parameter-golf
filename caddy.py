@@ -52,6 +52,8 @@ def get_bpb_from_logs(exp_path):
         log_files.append(global_log)
 
     if not log_files:
+        # Debug: print when no log files found
+        console.print(f"[dim]No log files found for {exp_path.name}[/dim]")
         return "N/A"
 
     # Sort by mtime to get the latest
@@ -61,13 +63,20 @@ def get_bpb_from_logs(exp_path):
         with open(latest_log, "r") as f:
             content = f.read()
 
+        # Debug: show file size
+        console.print(f"[dim]Scanning {latest_log.name} ({len(content)} bytes)[/dim]")
+
         # Look for the last val_bpb entry
-        # Matches: val_bpb:1.4152, val_bpb: 1.4152, or any other variation
-        # Updated regex to handle more formats including val_bpb=1.4152
+        # Matches: val_bpb:1.4152, val_bpb: 1.4152, val_bpb=1.4152
         matches = re.findall(r"val_bpb[:=\s]+(\d+\.\d+)", content)
         if matches:
+            console.print(f"[dim]Found {len(matches)} val_bpb entries, using last: {matches[-1]}[/dim]")
             return matches[-1]
-    except: pass
+        else:
+            # Debug: show what we found
+            console.print(f"[yellow]No val_bpb found in {latest_log.name}[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error reading {latest_log.name}: {e}[/red]")
     return "N/A"
 
 def is_my_experiment(path):
