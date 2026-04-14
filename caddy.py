@@ -70,27 +70,28 @@ def get_bpb_from_logs(exp_path):
         console.print(f"[dim]No log files found for {exp_path.name}[/dim]")
         return "N/A"
 
-    # Sort by mtime to get the latest
-    latest_log = max(log_files, key=lambda x: x.stat().st_mtime)
-    try:
-        # Read the entire file to ensure we capture all val_bpb entries
-        with open(latest_log, "r") as f:
-            content = f.read()
+    # Scan all log files and collect val_bpb entries
+    all_matches = []
+    for log_file in log_files:
+        try:
+            with open(log_file, "r") as f:
+                content = f.read()
 
-        # Debug: show file size
-        console.print(f"[dim]Scanning {latest_log.name} ({len(content)} bytes)[/dim]")
+            # Look for val_bpb entries in this file
+            matches = re.findall(r"val_bpb[:=\s]+(\d+\.\d+)", content)
+            if matches:
+                # Use the last occurrence in this file
+                all_matches.append(matches[-1])
+                # Debug for today's experiments
+                if exp_path.name.startswith("2026-04-14"):
+                    console.print(f"[dim]Found val_bpb={matches[-1]} in {log_file.name}[/dim]")
+        except:
+            pass
 
-        # Look for the last val_bpb entry
-        # Matches: val_bpb:1.4152, val_bpb: 1.4152, val_bpb=1.4152
-        matches = re.findall(r"val_bpb[:=\s]+(\d+\.\d+)", content)
-        if matches:
-            console.print(f"[dim]Found {len(matches)} val_bpb entries, using last: {matches[-1]}[/dim]")
-            return matches[-1]
-        else:
-            # Debug: show what we found
-            console.print(f"[yellow]No val_bpb found in {latest_log.name}[/yellow]")
-    except Exception as e:
-        console.print(f"[red]Error reading {latest_log.name}: {e}[/red]")
+    if all_matches:
+        # Return the last val_bpb found (most recent across all files)
+        return all_matches[-1]
+    
     return "N/A"
 
 def is_my_experiment(path):
