@@ -98,7 +98,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.float16()
+    X = G.to(pt_dtype)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -138,7 +138,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.float16)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=pt_dtype)
 
             curr = 0
             for i, p in enumerate(params):
@@ -256,7 +256,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=pt_dtype, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -731,7 +731,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, pt_dtype
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -759,10 +759,24 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
-    wandb_enabled = master_process and os.environ.get("WANDB_ENABLED", "0") == "1"
+    
+    # --- DYNAMIC HARDWARE CONFIGURATION ---
+    device_cap = torch.cuda.get_device_capability(device)
+    is_turing = device_cap[0] == 7
+    is_ampere_plus = device_cap[0] >= 8
+    
+    # Auto-select dtype
+    use_bf16 = is_ampere_plus
+    pt_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    
+    if master_process:
+        print(f"Hardware Detection: Capability {device_cap[0]}.{device_cap[1]}")
+        print(f"Using Dtype: {pt_dtype}, FlashAttention: {is_ampere_plus}")
 
+    wandb_enabled = master_process and os.environ.get("WANDB_ENABLED", "0") == "1"
     if wandb_enabled:
         config = {k: v for k, v in args.__class__.__dict__.items() if not k.startswith("__")}
+        config.update({"gpu_capability": f"{device_cap[0]}.{device_cap[1]}", "dtype": str(pt_dtype)})
         wandb.init(project="parameter-golf", name=args.run_id, config=config)
 
     # Fast math knobs
@@ -771,9 +785,10 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_flash_sdp(is_ampere_plus) # Only on Ampere+
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(not is_ampere_plus)
+    # ---------------------------------------
 
     logfile = None
     if master_process:
@@ -842,7 +857,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).half()
+    ).to(device).to(pt_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -951,7 +966,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=pt_dtype, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1021,7 +1036,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=pt_dtype, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
