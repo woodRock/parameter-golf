@@ -173,9 +173,9 @@ def launch_experiment(exp):
     is_ttt = "TTT" in exp['name']
     ttt_flag = "1" if is_ttt else "0"
     
-    # Use 1 GPU and 40GB+ capacity requirement to ensure we land on A40/A6000/L40S (Ampere+)
+    # Use 1 GPU and 45GB+ capacity requirement to guarantee A40/A6000/L40S (Ampere+)
     num_gpus = 1
-    min_mem = 40 # Targets 48GB cards (Safe for BF16)
+    min_mem = 45 # Targets 48GB cards ONLY (Safe for BF16/FlashAttention)
     
     run_cmd = f"task -G {num_gpus} -m {min_mem} bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node={num_gpus} train_gpt.py'"
     
