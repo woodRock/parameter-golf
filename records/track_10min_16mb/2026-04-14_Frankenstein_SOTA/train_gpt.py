@@ -436,24 +436,19 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor, g: Tensor | None = None) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor, g: Tensor | None = None, clip_sigmas: float = 2.5) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
+        # SDClip: Use k * std(row) for clipping
+        row_std = t32.std(dim=1)
+        clip_abs = clip_sigmas * row_std
+        
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
         
         if g is not None:
-            # Lite GPTQ: Use gradient magnitude as a proxy for the Hessian (Fisher information)
-            # This prioritizes accuracy for "important" weights.
-            w = g.float().abs().clamp_min(1e-6)
+            # Lite GPTQ: Use gradient magnitude as a proxy for importance
             q = torch.round(clipped / scale[:, None])
-            # (In a true GPTQ we'd adjust other weights, here we just ensure scaling is robust)
             q = torch.clamp(q, -127, 127).to(torch.int8).contiguous()
         else:
             q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
@@ -461,12 +456,13 @@ def quantize_float_tensor(t: Tensor, g: Tensor | None = None) -> tuple[Tensor, T
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    row_std = t32.std() if t32.numel() > 1 else torch.tensor(0.0)
+    clip_abs = float((clip_sigmas * row_std).item()) if t32.numel() > 1 else float(t32.abs().max().item())
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], grads: dict[str, Tensor] | None = None):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], grads: dict[str, Tensor] | None = None, clip_sigmas: float = 2.5):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -505,7 +501,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], grads: dict[str, Ten
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, g)
+        q, s = quantize_float_tensor(t, g, clip_sigmas=clip_sigmas)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -755,8 +751,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int,
+        parallel_residual_start: int,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.parallel_residual_start = parallel_residual_start
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -769,13 +769,19 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         
-        # Parallel Residuals: Attention and MLP read from the same pre-residual input
-        x_norm = self.attn_norm(x) # We can reuse the same norm for both or keep them separate
-        attn_out = self.attn(x_norm)
-        mlp_out = self.mlp(self.mlp_norm(x)) # Keeping mlp_norm separate as in GPT-J
-        
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        if self.layer_idx >= self.parallel_residual_start:
+            # Parallel Residuals: Attention and MLP read from the same pre-residual input
+            x_norm = self.attn_norm(x)
+            attn_out = self.attn(x_norm)
+            mlp_out = self.mlp(self.mlp_norm(x)) 
+            
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        else:
+            # Sequential Residuals
+            h = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+            x = h + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(h))
+            
         return x
 
 
@@ -793,6 +799,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        parallel_residual_start: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -814,6 +821,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    layer_idx=i,
+                    parallel_residual_start=parallel_residual_start,
                 )
                 for i in range(num_layers)
             ]
@@ -988,6 +997,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        parallel_residual_start=args.parallel_residual_start,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1237,7 +1247,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(ema.model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(ema.model.state_dict(), clip_sigmas=args.clip_sigmas)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
