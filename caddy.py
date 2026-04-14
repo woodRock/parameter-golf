@@ -173,8 +173,8 @@ def launch_experiment(exp):
     
     confirm = Prompt.ask("\nLaunch this task?", choices=["y", "n"], default="y")
     if confirm == "y":
-        env_str = " ".join([f"{k}={v}" for k, v in env_vars.items()])
-        full_cmd = f"cd {exp['path']} && {env_str} {run_cmd}"
+        export_str = " ".join([f"export {k}={v}" for k, v in env_vars.items()])
+        full_cmd = f"cd {exp['path']} && {export_str} && {run_cmd}"
         
         try:
             subprocess.run(full_cmd, shell=True, check=True)
