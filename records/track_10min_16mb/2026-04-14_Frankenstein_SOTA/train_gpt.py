@@ -62,7 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 5))
     model_dim = int(os.environ.get("MODEL_DIM", 640)) # Increased for 1024-vocab
     num_heads = int(os.environ.get("NUM_HEADS", 10)) 
     mlp_mult = int(os.environ.get("MLP_MULT", 3)) # Adjusted for balance
