@@ -62,9 +62,9 @@ def get_bpb_from_logs(exp_path):
             lines = f.readlines()[-100:]
             content = "".join(lines)
             
-        # Look for the last val_bpb or q_val_bpb entry
-        # Common formats: val_bpb:1.2345, val_bpb: 1.2345, final_int8_zlib_roundtrip ... val_bpb:1.2345
-        matches = re.findall(r"val_bpb:?\s*(\d+\.\d+)", content)
+        # Look for the last val_bpb entry
+        # Matches: val_bpb:1.4152, val_bpb: 1.4152, or any other variation
+        matches = re.findall(r"val_bpb[:\s]+(\d+\.\d+)", content)
         if matches:
             return matches[-1]
     except: pass
