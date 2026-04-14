@@ -43,31 +43,18 @@ def get_bpb_from_logs(exp_path):
             return json.loads(sub_json.read_text()).get("val_bpb", "N/A")
         except: pass
 
-    # Try the experiment directory first (recursively), then the global logs directory
-    # Filter out non-log files like requirements.txt
-    all_files = list(exp_path.rglob("*"))
-    txt_files = [f for f in all_files if f.suffix == ".txt"]
-    log_files_list = [f for f in all_files if f.suffix == ".log"]
-    log_files = [f for f in (txt_files + log_files_list) 
-                 if f.name not in ("requirements.txt", "README.md", "submission.json")]
+    # Check for a 'logs' subdirectory within the experiment (primary location)
+    log_files = []
+    exp_logs_dir = exp_path / "logs"
+    if exp_logs_dir.exists():
+        log_files = [f for f in exp_logs_dir.iterdir() if f.is_file() and f.suffix in (".txt", ".log")]
 
     # Also check the global logs folder for a file named after the experiment
     global_log = PROJECT_ROOT / "logs" / f"{exp_path.name}.txt"
     if global_log.exists():
         log_files.append(global_log)
-    
-    # Also check for a 'logs' subdirectory within the experiment
-    exp_logs_dir = exp_path / "logs"
-    if exp_logs_dir.exists():
-        log_files.extend([f for f in exp_logs_dir.rglob("*") if f.is_file() and f.suffix in (".txt", ".log")])
-
-    # Debug output for today's experiments
-    if exp_path.name.startswith("2026-04-14"):
-        console.print(f"[cyan]Debug {exp_path.name}: found {len(log_files)} log file(s): {[f.name for f in log_files]}[/cyan]")
 
     if not log_files:
-        # Debug: print when no log files found
-        console.print(f"[dim]No log files found for {exp_path.name}[/dim]")
         return "N/A"
 
     # Scan all log files and collect val_bpb entries
@@ -77,19 +64,13 @@ def get_bpb_from_logs(exp_path):
             with open(log_file, "r") as f:
                 content = f.read()
 
-            # Look for val_bpb entries in this file
             matches = re.findall(r"val_bpb[:=\s]+(\d+\.\d+)", content)
             if matches:
-                # Use the last occurrence in this file
                 all_matches.append(matches[-1])
-                # Debug for today's experiments
-                if exp_path.name.startswith("2026-04-14"):
-                    console.print(f"[dim]Found val_bpb={matches[-1]} in {log_file.name}[/dim]")
         except:
             pass
 
     if all_matches:
-        # Return the last val_bpb found (most recent across all files)
         return all_matches[-1]
     
     return "N/A"
