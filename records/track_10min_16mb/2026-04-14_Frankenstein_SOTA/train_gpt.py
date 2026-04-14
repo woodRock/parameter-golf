@@ -288,7 +288,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -356,7 +356,7 @@ def eval_val_ttt(
         
         # --- PHASE A: SCORE (LEGAL) ---
         model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             # Standard sliding window scoring within the chunk
             # Simplified here to just the chunk itself for speed
             x = chunk_tokens[:-1].unsqueeze(0)
