@@ -120,8 +120,13 @@ class CaddyApp(App):
         height: 1;
     }
 
+    #main-container {
+        height: 1fr;
+    }
+
     DataTable {
         height: 1fr;
+        width: 100%;
         border: none;
     }
 
@@ -135,18 +140,23 @@ class CaddyApp(App):
     }
 
     #left-pane {
-        width: 50%;
+        width: 1fr;
         height: 100%;
         border-right: solid $primary;
     }
 
     #right-pane {
-        width: 50%;
+        width: 1fr;
         height: 100%;
     }
 
     TabPane {
         padding: 0;
+        height: 1fr;
+    }
+
+    TabbedContent {
+        height: 1fr;
     }
 
     Footer {
@@ -186,7 +196,7 @@ class CaddyApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Label(f"⛳ GOLF CADDY | {PROJECT_ROOT}", id="header-title")
-        with Horizontal():
+        with Horizontal(id="main-container"):
             with Vertical(id="left-pane"):
                 with TabbedContent(id="tabs"):
                     with TabPane("🧪 Experiments", id="tab-exps"):
