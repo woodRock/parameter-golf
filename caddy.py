@@ -165,13 +165,13 @@ def launch_experiment(exp):
     
     export_str = " && ".join([f"export {k}={v}" for k, v in env_vars.items()])
     inner_cmd = f"{export_str} && torchrun --standalone --nproc_per_node=2 train_gpt.py"
-    run_cmd = f"task -G 2 -m 40 bash -c '{inner_cmd}'"
+    run_cmd = f"task -G 2 -m 80 bash -c '{inner_cmd}'"
     
     console.print("\n[bold white]Environment Variables:[/bold white]")
     for k, v in env_vars.items():
         console.print(f"  {k}={v}")
 
-    console.print(f"\n[bold white]Command:[/bold white]\n  task -G 2 bash -c 'export ... && torchrun ...'")
+    console.print(f"\n[bold white]Command:[/bold white]\n  {run_cmd}")
 
     confirm = Prompt.ask("\nLaunch this task?", choices=["y", "n"], default="y")
     if confirm == "y":
