@@ -733,6 +733,13 @@ class GPT(nn.Module):
 def main() -> None:
     global zeropower_via_newtonschulz5, pt_dtype
 
+    # --- INITIAL HARDWARE DETECTION ---
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device_cap = torch.cuda.get_device_capability()
+    pt_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
+    # ----------------------------------
+
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
@@ -747,9 +754,9 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if 32 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 32 so grad_accum_steps stays integral")
+    grad_accum_steps = 32 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
