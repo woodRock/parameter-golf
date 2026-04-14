@@ -772,13 +772,12 @@ def main() -> None:
     is_turing = device_cap[0] == 7
     is_ampere_plus = device_cap[0] >= 8
     
-    # Auto-select dtype
-    use_bf16 = is_ampere_plus
-    pt_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    # Auto-select dtype (Forced to BF16 since we are targeting Ampere+ via Caddy)
+    pt_dtype = torch.bfloat16
     
     if master_process:
         print(f"Hardware Detection: Capability {device_cap[0]}.{device_cap[1]}")
-        print(f"Using Dtype: {pt_dtype}, FlashAttention: {is_ampere_plus}")
+        print(f"Using Dtype: {pt_dtype}, FlashAttention: True")
 
     wandb_enabled = master_process and os.environ.get("WANDB_ENABLED", "0") == "1"
     if wandb_enabled:
@@ -792,9 +791,9 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(is_ampere_plus) # Only on Ampere+
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(not is_ampere_plus)
+    enable_flash_sdp(True) # Enabled for Ampere+
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
     # ---------------------------------------
 
     logfile = None
