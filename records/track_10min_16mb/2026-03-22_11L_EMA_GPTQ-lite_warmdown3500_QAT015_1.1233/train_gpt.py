@@ -956,6 +956,10 @@ def main() -> None:
     global zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))

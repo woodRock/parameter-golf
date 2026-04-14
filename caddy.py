@@ -177,7 +177,7 @@ def launch_experiment(exp):
     num_gpus = 1
     min_mem = 45 # Targets 48GB cards ONLY (Safe for BF16/FlashAttention)
     
-    run_cmd = f"task -G {num_gpus} -m {min_mem} bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node={num_gpus} train_gpt.py'"
+    run_cmd = f"task -G {num_gpus} -m {min_mem} bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export MAX_WALLCLOCK_SECONDS=4800 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node={num_gpus} train_gpt.py'"
     
     console.print(f"\n[bold white]Variant Config:[/bold white]")
     console.print(f"  Tokenizer: [cyan]{variant}[/cyan]  Vocab: [cyan]{vocab_size}[/cyan]  TTT: [cyan]{'Enabled' if is_ttt else 'Disabled'}[/cyan]")

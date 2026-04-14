@@ -733,6 +733,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------

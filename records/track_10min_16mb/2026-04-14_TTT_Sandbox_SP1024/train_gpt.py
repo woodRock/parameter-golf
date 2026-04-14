@@ -27,6 +27,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -856,6 +859,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
 
     # -----------------------------

@@ -1383,6 +1383,10 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
 def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     # zeropower_via_newtonschulz5 runs eagerly with bmm -- do NOT compile
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))

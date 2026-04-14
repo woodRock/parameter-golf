@@ -27,6 +27,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -86,10 +89,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
 
     # TTT hyperparameters
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32768))
@@ -770,6 +773,7 @@ class Block(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.parallel_residual_start = parallel_residual_start
+        self.is_parallel = layer_idx >= parallel_residual_start
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -782,7 +786,7 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         
-        if self.layer_idx >= self.parallel_residual_start:
+        if self.is_parallel:
             # Parallel Residuals: Attention and MLP read from the same pre-residual input
             x_norm = self.attn_norm(x)
             attn_out = self.attn(x_norm)
@@ -903,6 +907,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
 
     # -----------------------------

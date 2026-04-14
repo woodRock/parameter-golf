@@ -847,31 +847,19 @@ def _accumulate_bpb(
 
 def eval_val_ttt_lora(
     args: Hyperparameters,
-    base_model: GPT,
+    model: nn.Module,
     rank: int,
     world_size: int,
     device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    max_wallclock_ms: float | None = None,
+    t0: float | None = None,
+    training_time_ms: float = 0.0,
 ) -> tuple[float, float]:
-    """Evaluate with batched LoRA test-time training. Returns (val_loss, val_bpb)."""
-    # Load validation tokens and find document boundaries
-    files = sorted(glob.glob(args.val_files))
-    all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
-    docs = _find_docs(all_tokens)
-
-    # Each rank takes a contiguous slice of documents
-    rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
-    chunk_size = args.ttt_chunk_size
-    eval_seq_len = args.ttt_eval_seq_len
-    batch_size = args.ttt_batch_size
-    lora_rank = args.ttt_lora_rank
-
-    rank_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
-
-    base_model.eval()
-    for p in base_model.parameters():
         p.requires_grad_(False)
 
     lora = BatchedTTTLoRA(batch_size, base_model, lora_rank).to(device)
@@ -963,6 +951,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    # Simple CLI override for wallclock
+    for i, arg in enumerate(sys.argv):
+        if arg == "--wallclock" and i + 1 < len(sys.argv):
+            args.max_wallclock_seconds = float(sys.argv[i+1])
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1357,6 +1349,10 @@ def main() -> None:
     ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
         args, base_model, rank, world_size, device,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    ,
+        max_wallclock_ms=max_wallclock_ms,
+        t0=t0,
+        training_time_ms=training_time_ms,
     )
     torch.cuda.synchronize()
     log0(
