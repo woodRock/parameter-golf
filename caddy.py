@@ -36,22 +36,32 @@ def get_leaderboard():
     return rows[:10]
 
 def list_experiments():
-    base_dir = PROJECT_ROOT / "records" / "track_10min_16mb"
-    if not base_dir.exists():
+    records_dir = PROJECT_ROOT / "records"
+    if not records_dir.exists():
         return []
     
+    all_dirs = []
+    # Scan both track_10min_16mb and track_non_record_16mb
+    for track in records_dir.iterdir():
+        if track.is_dir():
+            for d in track.iterdir():
+                if d.is_dir():
+                    all_dirs.append(d)
+    
+    # Sort by directory name (which starts with YYYY-MM-DD) descending
+    all_dirs.sort(key=lambda x: x.name, reverse=True)
+    
     experiments = []
-    for d in sorted(base_dir.iterdir(), reverse=True):
-        if d.is_dir():
-            sub_json = d / "submission.json"
-            bpb = "N/A"
-            if sub_json.exists():
-                try:
-                    data = json.loads(sub_json.read_text())
-                    bpb = data.get("val_bpb", "N/A")
-                except:
-                    pass
-            experiments.append({"name": d.name, "path": d, "bpb": bpb})
+    for d in all_dirs:
+        sub_json = d / "submission.json"
+        bpb = "N/A"
+        if sub_json.exists():
+            try:
+                data = json.loads(sub_json.read_text())
+                bpb = data.get("val_bpb", "N/A")
+            except:
+                pass
+        experiments.append({"name": d.name, "path": d, "bpb": bpb})
     return experiments
 
 def show_main_menu():
