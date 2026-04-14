@@ -13,8 +13,8 @@ from rich.prompt import Prompt, IntPrompt
 
 console = Console()
 
-# Find the project root (where this script lives)
-PROJECT_ROOT = Path(__file__).parent.resolve()
+# Find the project root (follow symlinks to the actual script location)
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 def get_leaderboard():
     readme_path = PROJECT_ROOT / "README.md"
