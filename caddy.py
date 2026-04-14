@@ -42,10 +42,10 @@ def get_bpb_from_logs(exp_path):
         try:
             return json.loads(sub_json.read_text()).get("val_bpb", "N/A")
         except: pass
-    
+
     # Try the experiment directory first (recursively), then the global logs directory
     log_files = list(exp_path.rglob("*.txt")) + list(exp_path.rglob("*.log"))
-    
+
     # Also check the global logs folder for a file named after the experiment
     global_log = PROJECT_ROOT / "logs" / f"{exp_path.name}.txt"
     if global_log.exists():
@@ -53,18 +53,18 @@ def get_bpb_from_logs(exp_path):
 
     if not log_files:
         return "N/A"
-    
+
     # Sort by mtime to get the latest
     latest_log = max(log_files, key=lambda x: x.stat().st_mtime)
     try:
-        # Read the last 100 lines for efficiency
+        # Read the entire file to ensure we capture all val_bpb entries
         with open(latest_log, "r") as f:
-            lines = f.readlines()[-100:]
-            content = "".join(lines)
-            
+            content = f.read()
+
         # Look for the last val_bpb entry
         # Matches: val_bpb:1.4152, val_bpb: 1.4152, or any other variation
-        matches = re.findall(r"val_bpb[:\s]+(\d+\.\d+)", content)
+        # Updated regex to handle more formats including val_bpb=1.4152
+        matches = re.findall(r"val_bpb[:=\s]+(\d+\.\d+)", content)
         if matches:
             return matches[-1]
     except: pass
