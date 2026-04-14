@@ -149,14 +149,12 @@ def show_main_menu(show_global=False):
 
 def launch_experiment(exp):
     console.print(Panel(f"🚀 Preparing to launch: [bold green]{exp['name']}[/bold green]"))
-    
+
     # Use absolute paths for the run
     data_path = (PROJECT_ROOT / "data" / "datasets" / "fineweb10B_sp1024").resolve()
     token_path = (PROJECT_ROOT / "data" / "tokenizers" / "fineweb_1024_bpe.model").resolve()
     vocab_size = "1024"
-    
-    run_cmd = f"task -G 2 torchrun --standalone --nproc_per_node=2 train_gpt.py"
-    
+
     env_vars = {
         "RUN_ID": exp['name'],
         "WANDB_ENABLED": "1",
@@ -165,16 +163,19 @@ def launch_experiment(exp):
         "VOCAB_SIZE": vocab_size
     }
     
+    export_str = " && ".join([f"export {k}={v}" for k, v in env_vars.items()])
+    inner_cmd = f"{export_str} && torchrun --standalone --nproc_per_node=2 train_gpt.py"
+    run_cmd = f"task -G 2 bash -c '{inner_cmd}'"
+    
     console.print("\n[bold white]Environment Variables:[/bold white]")
     for k, v in env_vars.items():
         console.print(f"  {k}={v}")
-    
-    console.print(f"\n[bold white]Command:[/bold white]\n  {run_cmd}")
-    
+
+    console.print(f"\n[bold white]Command:[/bold white]\n  task -G 2 bash -c 'export ... && torchrun ...'")
+
     confirm = Prompt.ask("\nLaunch this task?", choices=["y", "n"], default="y")
     if confirm == "y":
-        export_str = " ".join([f"export {k}={v}" for k, v in env_vars.items()])
-        full_cmd = f"cd {exp['path']} && {export_str} && {run_cmd}"
+        full_cmd = f"cd {exp['path']} && {run_cmd}"
         
         try:
             subprocess.run(full_cmd, shell=True, check=True)
