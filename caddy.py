@@ -35,62 +35,92 @@ def get_leaderboard():
             rows.append(parts)
     return rows[:10]
 
+def get_bpb_from_logs(exp_path):
+    # Try submission.json first
+    sub_json = exp_path / "submission.json"
+    if sub_json.exists():
+        try:
+            return json.loads(sub_json.read_text()).get("val_bpb", "N/A")
+        except: pass
+    
+    # Try to find the latest log file in the experiment dir
+    log_files = list(exp_path.glob("*.txt")) + list(exp_path.glob("*.log"))
+    if not log_files:
+        return "N/A"
+    
+    # Sort by mtime to get the latest
+    latest_log = max(log_files, key=lambda x: x.stat().st_mtime)
+    try:
+        content = latest_log.read_text()
+        # Look for the last final_int8_zlib_roundtrip or val_bpb entry
+        matches = re.findall(r"val_bpb:(\d+\.\d+)", content)
+        if matches:
+            return matches[-1]
+    except: pass
+    return "N/A"
+
+def is_my_experiment(path):
+    try:
+        # Check if the directory was created/touched by woodRock in git
+        res = subprocess.run(
+            ["git", "log", "--format=%an", "-n", "1", "--", str(path)],
+            cwd=PROJECT_ROOT, capture_output=True, text=True
+        )
+        return "woodRock" in res.stdout
+    except:
+        return False
+
 def list_experiments():
     records_dir = PROJECT_ROOT / "records"
     if not records_dir.exists():
-        return []
+        return [], []
     
-    all_dirs = []
-    # Scan both track_10min_16mb and track_non_record_16mb
+    my_exps = []
+    others = []
+    
     for track in records_dir.iterdir():
         if track.is_dir():
             for d in track.iterdir():
                 if d.is_dir():
-                    all_dirs.append(d)
+                    info = {"name": d.name, "path": d, "bpb": get_bpb_from_logs(d)}
+                    if is_my_experiment(d) or "2026-04-14" in d.name:
+                        my_exps.append(info)
+                    else:
+                        others.append(info)
     
-    # Sort by directory name (which starts with YYYY-MM-DD) descending
-    all_dirs.sort(key=lambda x: x.name, reverse=True)
-    
-    experiments = []
-    for d in all_dirs:
-        sub_json = d / "submission.json"
-        bpb = "N/A"
-        if sub_json.exists():
-            try:
-                data = json.loads(sub_json.read_text())
-                bpb = data.get("val_bpb", "N/A")
-            except:
-                pass
-        experiments.append({"name": d.name, "path": d, "bpb": bpb})
-    return experiments
+    my_exps.sort(key=lambda x: x["name"], reverse=True)
+    others.sort(key=lambda x: x["name"], reverse=True)
+    return my_exps, others
 
 def show_main_menu():
     console.clear()
-    console.print(Panel("[bold green]⛳ GOLF CADDY[/bold green]\n[dim]The Parameter Golf Experiment Manager[/dim]", expand=False))
+    console.print(f"[bold green]⛳ GOLF CADDY[/bold green] [dim]| {PROJECT_ROOT}[/dim]", justify="center")
     
-    # Show Leaderboard
+    my_exps, others = list_experiments()
+    
+    # Create side-by-side or stacked tables
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("Your Experiments", style="bold green")
+    table.add_column("Global SOTA", style="bold yellow")
+    
+    # Local Table
+    local_t = Table(border_style="green", header_style="bold green", x_ratio=None)
+    local_t.add_column("#", style="dim", width=2)
+    local_t.add_column("Experiment", width=30)
+    local_t.add_column("BPB", justify="right")
+    for i, exp in enumerate(my_exps[:15]):
+        local_t.add_row(str(i+1), exp["name"], str(exp["bpb"]))
+        
+    # SOTA Table (from README)
+    sota_t = Table(border_style="yellow", header_style="bold yellow")
+    sota_t.add_column("Run", width=30)
+    sota_t.add_column("BPB", justify="right")
     lb = get_leaderboard()
-    if lb:
-        table = Table(title="🏆 Global Leaderboard (Top 10)", border_style="yellow")
-        table.add_column("Run", style="cyan", no_wrap=True)
-        table.add_column("Score (BPB)", style="green")
-        table.add_column("Author", style="magenta")
-        for row in lb:
-            table.add_row(row[0], row[1], row[2])
-        console.print(table)
-
-    # Show Local Experiments
-    exps = list_experiments()
-    table = Table(title="🧪 Your Experiments", border_style="blue")
-    table.add_column("#", style="dim")
-    table.add_column("Experiment ID", style="bold white")
-    table.add_column("Last BPB", style="green")
-    
-    for i, exp in enumerate(exps):
-        table.add_row(str(i+1), exp["name"], str(exp["bpb"]))
-    console.print(table)
-
-    console.print("\n[bold cyan][1-N][/bold cyan] Launch Experiment   [bold yellow][R][/bold yellow] Refresh   [bold red][Q][/bold red] Quit")
+    for row in lb[:10]:
+        sota_t.add_row(row[0][:30], row[1])
+        
+    console.print(local_t, sota_t, justify="center")
+    console.print("\n [bold cyan][1-N][/bold cyan] Launch   [bold yellow][R][/bold yellow] Refresh   [bold red][Q][/bold red] Quit", justify="center")
 
 def launch_experiment(exp):
     console.print(Panel(f"🚀 Preparing to launch: [bold green]{exp['name']}[/bold green]"))
@@ -144,9 +174,9 @@ def main():
             continue
         elif choice.isdigit():
             idx = int(choice) - 1
-            exps = list_experiments()
-            if 0 <= idx < len(exps):
-                launch_experiment(exps[idx])
+            my_exps, others = list_experiments()
+            if 0 <= idx < len(my_exps):
+                launch_experiment(my_exps[idx])
             else:
                 console.print("[bold red]Invalid index![/bold red]")
                 time.sleep(1)
