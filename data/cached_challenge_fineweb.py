@@ -126,18 +126,28 @@ def main() -> None:
 
     manifest = load_manifest(skip_manifest_download=args.skip_manifest)
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir), None)
+    
     if dataset_entry is None:
-        raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
-    max_train_shards = int((dataset_entry.get("stats") or {}).get("files_train"))
-    val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
+        if args.skip_manifest:
+            # Provide sensible defaults if manifest is missing/skipped
+            print(f"⚠️ Warning: {dataset_dir} not in manifest. Using defaults for download.")
+            val_shards = 1
+            max_train_shards = 100
+            tokenizer_entry = {"name": f"sp_bpe_{args.variant[2:]}"} 
+        else:
+            raise ValueError(f"dataset {dataset_dir} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+    else:
+        max_train_shards = int((dataset_entry.get("stats") or {}).get("files_train"))
+        val_shards = int((dataset_entry.get("stats") or {}).get("files_val"))
+        tokenizer_name = dataset_entry.get("tokenizer_name")
+        tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
+        if tokenizer_entry is None:
+            raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
+
     if train_shards > max_train_shards:
         raise ValueError(
             f"{args.variant} only has {max_train_shards} training shards on {REPO_ID}, requested {train_shards}"
         )
-    tokenizer_name = dataset_entry.get("tokenizer_name")
-    tokenizer_entry = next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
-    if tokenizer_entry is None:
-        raise ValueError(f"tokenizer {tokenizer_name} not found in {REMOTE_ROOT_PREFIX}/manifest.json")
 
     if args.with_docs:
         get(f"{REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
