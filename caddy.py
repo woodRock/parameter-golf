@@ -44,12 +44,19 @@ def get_bpb_from_logs(exp_path):
         except: pass
 
     # Try the experiment directory first (recursively), then the global logs directory
-    log_files = list(exp_path.rglob("*.txt")) + list(exp_path.rglob("*.log"))
+    # Filter out non-log files like requirements.txt
+    log_files = [f for f in (list(exp_path.rglob("*.txt")) + list(exp_path.rglob("*.log"))) 
+                 if f.name not in ("requirements.txt", "README.md")]
 
     # Also check the global logs folder for a file named after the experiment
     global_log = PROJECT_ROOT / "logs" / f"{exp_path.name}.txt"
     if global_log.exists():
         log_files.append(global_log)
+    
+    # Also check for a 'logs' subdirectory within the experiment
+    exp_logs_dir = exp_path / "logs"
+    if exp_logs_dir.exists():
+        log_files.extend([f for f in exp_logs_dir.rglob("*") if f.is_file() and f.suffix in (".txt", ".log")])
 
     if not log_files:
         # Debug: print when no log files found
