@@ -85,7 +85,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # TTT hyperparameters
@@ -137,8 +137,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.to(pt_dtype)
 
-    # Row normalization (MuonEq-R)
-    X /= X.norm(dim=1, keepdim=True) + eps
+    # Global normalization
+    X /= X.norm() + eps
 
     transposed = G.size(0) > G.size(1)
     if transposed:
