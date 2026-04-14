@@ -850,10 +850,10 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             
-            # Depth Recurrence: Repeat layers 3, 4, 5 (if we have at least 6 layers)
-            if i == self.num_encoder_layers - 1 and self.num_encoder_layers >= 6:
-                # Recurrence Loop: repeat blocks[3], blocks[4], blocks[5]
-                for j in range(3, 6):
+            # Depth Recurrence: Repeat the last 3 encoder layers
+            if i == self.num_encoder_layers - 1 and self.num_encoder_layers >= 3:
+                # Recurrence Loop: repeat blocks[self.num_encoder_layers-3...self.num_encoder_layers-1]
+                for j in range(self.num_encoder_layers - 3, self.num_encoder_layers):
                     x = self.blocks[j](x, x0)
             
             skips.append(x)
