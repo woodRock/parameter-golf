@@ -737,7 +737,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device_cap = torch.cuda.get_device_capability()
-    pt_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
+    pt_dtype = torch.bfloat16
     # ----------------------------------
 
     code = Path(__file__).read_text(encoding="utf-8")
@@ -863,7 +863,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).to(pt_dtype)
+    ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()

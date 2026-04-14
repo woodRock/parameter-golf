@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-pt_dtype = torch.float16 # Default
+pt_dtype = torch.bfloat16 # Default
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -751,7 +751,7 @@ def main() -> None:
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
 
     device_cap = torch.cuda.get_device_capability()
-    pt_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
+    pt_dtype = torch.bfloat16
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -763,9 +763,9 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if 32 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 32 so grad_accum_steps stays integral")
+    grad_accum_steps = 32 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -787,7 +787,7 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True if device_cap[0] >= 8 else False)
+    enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
@@ -858,7 +858,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).half()
+    ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
