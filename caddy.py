@@ -77,12 +77,15 @@ def get_bpb_from_logs(exp_path):
 
 def is_my_experiment(path):
     try:
-        # Check the FIRST author of the directory to see who created it
+        # Check the VERY FIRST author of the directory
         res = subprocess.run(
-            ["git", "log", "--reverse", "--format=%an", "-n", "1", "--", str(path)],
+            ["git", "log", "--reverse", "--format=%an", str(path)],
             cwd=PROJECT_ROOT, capture_output=True, text=True
         )
-        return "woodRock" in res.stdout
+        authors = res.stdout.strip().split("\n")
+        if not authors:
+            return False
+        return "woodRock" in authors[0]
     except:
         return False
 
