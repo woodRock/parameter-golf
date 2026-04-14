@@ -81,12 +81,12 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.095))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # TTT hyperparameters
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
