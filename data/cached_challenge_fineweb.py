@@ -153,7 +153,7 @@ def main() -> None:
         get(f"{REMOTE_ROOT_PREFIX}/docs_selected.jsonl")
         get(f"{REMOTE_ROOT_PREFIX}/docs_selected.source_manifest.json")
 
-    dataset_prefix = f"{REMOTE_ROOT_PREFIX}/datasets/{dataset_dir}"
+    dataset_prefix = f"datasets/{dataset_dir}" if REMOTE_ROOT_PREFIX == "datasets" else f"{REMOTE_ROOT_PREFIX}/{dataset_dir}"
     for i in range(val_shards):
         get(f"{dataset_prefix}/fineweb_val_{i:06d}.bin")
     for i in range(train_shards):
