@@ -104,7 +104,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.float16()
+    X = G.to(pt_dtype)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -830,11 +830,18 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, pt_dtype
+
+    # --- INITIAL HARDWARE DETECTION ---
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device_cap = torch.cuda.get_device_capability()
+    pt_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
+    # ----------------------------------
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP

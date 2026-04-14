@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+pt_dtype = torch.float16 # Default
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -98,7 +100,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.float16()
+    X = G.to(pt_dtype)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -138,7 +140,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.float16)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=pt_dtype)
 
             curr = 0
             for i, p in enumerate(params):
@@ -256,7 +258,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=pt_dtype, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -742,11 +744,14 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, pt_dtype
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, fullgraph=False)
+
+    device_cap = torch.cuda.get_device_capability()
+    pt_dtype = torch.bfloat16 if device_cap[0] >= 8 else torch.float16
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -782,7 +787,7 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
+    enable_flash_sdp(True if device_cap[0] >= 8 else False)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
 
