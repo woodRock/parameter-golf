@@ -621,14 +621,50 @@ def main():
     if distributed: dist.init_process_group(backend="nccl", device_id=device)
     master_process = rank == 0
     wandb_enabled = master_process and os.environ.get("WANDB_ENABLED", "0") == "1"
-    if wandb_enabled: wandb.init(project="parameter-golf", name=args.run_id, config={k:v for k,v in args.__class__.__dict__.items() if not k.startswith("__")})
+    if wandb_enabled: wandb.init(project="parameter-golf", name=args.run_id, config=vars(args))
     
+    logfile = None
+    if master_process:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg: str, console: bool = True) -> None:
+        if not master_process:
+            return
+        if console:
+            print(msg)
+        if logfile is not None:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    code = Path(__file__).read_text(encoding="utf-8")
+    log0(code, console=False)
+    log0("=" * 100, console=False)
+    log0(f"Running Python {sys.version}", console=False)
+    log0(f"Running PyTorch {torch.__version__}", console=False)
+    try:
+        log0(subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout, console=False)
+    except Exception:
+        pass
+    log0("=" * 100, console=False)
+
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
     
+    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+
     base_model = GPT(args).to(device).bfloat16()
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"model_params:{n_params}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
+    log0(f"seed:{args.seed}")
+
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model)
     model = DDP(compiled_model, device_ids=[local_rank]) if distributed else compiled_model
@@ -661,7 +697,7 @@ def main():
                 (warmup_loss * grad_scale).backward()
             opt_muon.step(); opt_adam.step()
             if master_process and (warmup_step + 1) % 10 == 0:
-                print(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip([opt_muon, opt_adam], initial_optimizer_states):
@@ -677,8 +713,8 @@ def main():
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize(); training_time_ms += 1000.0 * (time.perf_counter() - t0)
             v_loss, v_bpb = eval_val(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
-            if master_process: print(f"step:{step} val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} (EMA)")
-            if wandb_enabled: wandb.log({"val/loss": v_loss, "val/bpb": v_bpb}, step=step)
+            if master_process: log0(f"step:{step}/{args.iterations} val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} (EMA) train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
+            if wandb_enabled: wandb.log({"val/loss": v_loss, "val/bpb": v_bpb, "train/time_ms": training_time_ms}, step=step)
             if last_step: break
             torch.cuda.synchronize(); t0 = time.perf_counter()
 
@@ -694,7 +730,10 @@ def main():
         for opt in [opt_muon, opt_adam]:
             for g in opt.param_groups: g["lr"] = args.matrix_lr * scale
         opt_muon.step(); opt_adam.step(); ema.update(base_model); step += 1
-        if master_process and step % args.train_log_every == 0: print(f"step:{step} loss:{loss.item():.4f}")
+        if master_process and (step <= 10 or step % args.train_log_every == 0):
+            approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            log0(f"step:{step}/{args.iterations} train_loss:{loss.item():.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms")
+            if wandb_enabled: wandb.log({"train/loss": loss.item(), "train/lr_scale": scale}, step=step)
 
     if master_process:
         quant_obj = quantize_state_dict_int8(ema.model.state_dict(), args.clip_k_matrix, args.clip_k_embed)
@@ -706,7 +745,7 @@ def main():
     eval_fn = eval_val_ttt if args.ttt_enabled else eval_val
     q_loss, q_bpb = eval_fn(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, max_wallclock_ms=args.max_wallclock_seconds*1000, t0=t0, training_time_ms=training_time_ms)
     if master_process:
-        print(f"final_int8_zlib_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
+        log0(f"final_int8_zlib_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
         if wandb_enabled: wandb.log({"final/val_loss": q_loss, "final/val_bpb": q_bpb}); wandb.finish()
     if distributed: dist.destroy_process_group()
 
