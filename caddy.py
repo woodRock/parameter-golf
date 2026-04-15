@@ -278,15 +278,28 @@ class CaddyApp(App):
     def action_toggle_theme(self) -> None:
         self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
 
+    @on(DataTable.RowSelected)
+    def on_row_selected(self, event: DataTable.RowSelected) -> None:
+        # If we are on the experiments table, trigger the launch action
+        if event.data_table.id == "exp-table":
+            self.action_launch()
+
     def action_launch(self) -> None:
         active_tab = self.query_one(TabbedContent).active
         if active_tab == "tab-exps":
             exp_table = self.query_one("#exp-table", DataTable)
             cursor_row = exp_table.cursor_row
             if cursor_row is not None:
+                # Get the experiment name from the second column (index 1) of the highlighted row
+                row_data = exp_table.get_row_at(cursor_row)
+                exp_id = row_data[1]
+                
                 target_list = self.others if self.show_global else self.my_exps
-                if cursor_row < len(target_list):
-                    self.launch_experiment(target_list[cursor_row])
+                # Find the experiment in the metadata list by name
+                exp = next((e for e in target_list if e["name"] == exp_id), None)
+                
+                if exp:
+                    self.launch_experiment(exp)
         elif active_tab == "tab-tasks":
             self.notify("Task management coming soon!", severity="info")
         elif active_tab == "tab-leaderboard":
@@ -297,6 +310,8 @@ class CaddyApp(App):
         variant = "sp8192" if is_sp8192 else "sp1024"
         vocab_size = "8192" if is_sp8192 else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
+        
+        # Paths relative to project root
         data_path = (PROJECT_ROOT / "data" / "datasets" / f"fineweb10B_{variant}").resolve()
         token_path = (PROJECT_ROOT / "data" / "tokenizers" / model_file).resolve()
         
@@ -307,18 +322,24 @@ class CaddyApp(App):
         is_ttt = "TTT" in exp['name']
         ttt_flag = "1" if is_ttt else "0"
         
-        run_cmd = f"bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export MAX_WALLCLOCK_SECONDS=4800 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node=1 train_gpt.py --wallclock 4800'"
-        task_cmd = f"task -G 1 -m 45 -n {exp['name']} {run_cmd}"
+        # Use the specific train_gpt.py in the experiment folder if it exists, otherwise fall back to root
+        script_path = exp['path'] / "train_gpt.py"
+        if not script_path.exists():
+            script_path = PROJECT_ROOT / "train_gpt.py"
+        
+        run_cmd = f"bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export MAX_WALLCLOCK_SECONDS=4800 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node=1 {script_path}'"
+        task_cmd = f"task -G 1 -m 45 -n {exp['name']} \"{run_cmd}\""
         
         def run_it():
             os.system("clear")
-            print(f"🚀 Spooling experiment to task queue: {exp['name']}\n")
+            print(f"🚀 Launching experiment: {exp['name']}\n")
             print(f"Command:\n{task_cmd}\n")
-            subprocess.run(f"cd {exp['path']} && {task_cmd}", shell=True)
+            # We run the task from the project root but point it at the experiment's script
+            subprocess.run(task_cmd, shell=True, cwd=PROJECT_ROOT)
             print("\n[bold green]✅ Task submitted to queue.[/bold green]")
             input("\nPress Enter to return to Caddy...")
 
-        self.app.suspend_process(run_it)
+        self.suspend_process(run_it)
         self.action_refresh()
 
 if __name__ == "__main__":
