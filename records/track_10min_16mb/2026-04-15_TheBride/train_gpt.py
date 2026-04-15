@@ -658,6 +658,8 @@ def main():
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
     
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    actual_train_files = len(glob.glob(args.train_files))
+    log0(f"train_loader:dataset:{Path(args.data_path).name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     base_model = GPT(args).to(device).bfloat16()
@@ -719,7 +721,10 @@ def main():
             v_loss, v_bpb = eval_val(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
             if master_process: log0(f"step:{step}/{args.iterations} val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} (EMA) train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             if wandb_enabled: wandb.log({"val/loss": v_loss, "val/bpb": v_bpb, "train/time_ms": training_time_ms}, step=step)
-            if last_step: break
+            if last_step:
+                if training_time_ms >= args.max_wallclock_seconds * 1000 and step < args.iterations:
+                    log0(f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms step:{step}/{args.iterations}")
+                break
             torch.cuda.synchronize(); t0 = time.perf_counter()
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
