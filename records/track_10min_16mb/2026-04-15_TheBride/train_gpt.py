@@ -263,6 +263,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    step_frac: float = 0.0,
     **kwargs,
 ) -> tuple[float, float]:
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
@@ -286,7 +287,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, step_frac=step_frac, is_eval=True).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -321,6 +322,7 @@ def eval_val_ttt(
     max_wallclock_ms: float | None = None,
     t0: float | None = None,
     training_time_ms: float = 0.0,
+    step_frac: float = 1.0,
 ) -> tuple[float, float]:
     total_tokens = val_tokens.numel() - 1
     chunk_size = args.ttt_chunk_size
@@ -350,7 +352,7 @@ def eval_val_ttt(
             x = chunk_tokens[:-1].unsqueeze(0)
             y = chunk_tokens[1:].unsqueeze(0)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y, is_eval=True).detach()
+                batch_loss = model(x, y, step_frac=step_frac, is_eval=True).detach()
             
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -372,7 +374,7 @@ def eval_val_ttt(
             
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, is_eval=True)
+                loss = model(x, y, step_frac=step_frac, is_eval=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -596,7 +598,7 @@ class GPT(nn.Module):
         x = F.rms_norm(self.tok_emb(input_ids), (self.h.model_dim,))
         x0, skips = x, []
         # Recurrence activation logic
-        recurrence_active = is_eval or step_frac >= self.h.recurrence_start_frac
+        recurrence_active = step_frac >= self.h.recurrence_start_frac
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             if i == self.num_encoder_layers - 1 and self.num_encoder_layers >= 3 and recurrence_active:
@@ -716,9 +718,10 @@ def main():
     while True:
 
         last_step = step == args.iterations or (training_time_ms >= args.max_wallclock_seconds * 1000)
+        frac = step / args.iterations
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize(); training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            v_loss, v_bpb = eval_val(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+            v_loss, v_bpb = eval_val(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, step_frac=frac)
             if master_process: log0(f"step:{step}/{args.iterations} val_loss:{v_loss:.4f} val_bpb:{v_bpb:.4f} (EMA) train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms")
             if wandb_enabled: wandb.log({"val/loss": v_loss, "val/bpb": v_bpb, "train/time_ms": training_time_ms}, step=step)
             if last_step:
@@ -755,7 +758,7 @@ def main():
     with open("final_model.int8.ptz", "rb") as f: q_state = torch.load(io.BytesIO(zlib.decompress(f.read())), map_location="cpu")
     ema.model.load_state_dict(dequantize_state_dict_int8(q_state), strict=True)
     eval_fn = eval_val_ttt if args.ttt_enabled else eval_val
-    q_loss, q_bpb = eval_fn(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, max_wallclock_ms=args.max_wallclock_seconds*1000, t0=t0, training_time_ms=training_time_ms)
+    q_loss, q_bpb = eval_fn(args, ema.model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, max_wallclock_ms=args.max_wallclock_seconds*1000, t0=t0, training_time_ms=training_time_ms, step_frac=1.0)
     if master_process:
         log0(f"final_int8_zlib_roundtrip val_loss:{q_loss:.4f} val_bpb:{q_bpb:.4f}")
         if wandb_enabled: wandb.log({"final/val_loss": q_loss, "final/val_bpb": q_bpb}); wandb.finish()
