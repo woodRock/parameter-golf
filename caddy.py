@@ -331,16 +331,15 @@ class CaddyApp(App):
         if not script_path.exists():
             script_path = PROJECT_ROOT / "train_gpt.py"
         
-        # Simplified quoting: avoid nested bash -c if possible, or use cleaner quoting
-        # The 'task' command itself likely handles the arguments. 
-        # We pass variables as a single string of exports + command.
-        env_vars = f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}"
-        torch_cmd = f"torchrun --standalone --nproc_per_node=1 {script_path}"
-        
-        # Construct the final command string without double-wrapping in bash -c if task supports it
-        # Based on the error log, it seems the runner is wrapping our command in yet another bash -c.
-        final_run_cmd = f"{env_vars} {torch_cmd}"
-        task_cmd = f"task -G 1 -m 45 -n {exp['name']} '{final_run_cmd}'"
+        # Construct environment variables and command
+        # We wrap the command in bash -c explicitly to ensure environment variables are handled correctly
+        inner_cmd = (
+            f"export WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 "
+            f"RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}; "
+            f"torchrun --standalone --nproc_per_node=1 {script_path}"
+        )
+        # Use single quotes for the inner command to avoid shell expansion issues
+        task_cmd = f"task -G 1 -m 45 -n {exp['name']} \"bash -c '{inner_cmd}'\""
         
         def run_it(interactive: bool = True):
             if interactive:
