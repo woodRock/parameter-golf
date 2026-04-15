@@ -136,7 +136,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     X = G.to(pt_dtype)
 
     # Row-wise normalization (MuonEq-R style)
-    X /= X.norm(dim=-1, keepdim=True) + eps
+    X /= X.float().norm(dim=-1, keepdim=True).clamp_min(eps).to(pt_dtype)
 
     transposed = G.size(0) > G.size(1)
     if transposed:
