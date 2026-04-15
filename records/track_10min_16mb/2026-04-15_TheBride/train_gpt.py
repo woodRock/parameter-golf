@@ -639,7 +639,36 @@ def main():
     opt_adam = torch.optim.Adam([{"params": scalar_params + [base_model.tok_emb.weight], "lr": args.matrix_lr}], betas=(0.9, 0.95), fused=True)
     
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    ema = EMA(base_model, args.ema_decay); training_time_ms, step = 0.0, 0; t0 = time.perf_counter()
+    ema = EMA(base_model, args.ema_decay)
+
+    def zero_grad_all() -> None:
+        for opt in [opt_muon, opt_adam]:
+            opt.zero_grad(set_to_none=True)
+
+    # Warmup primes the compiled paths, then we restore init weights
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in [opt_muon, opt_adam]]
+        model.train()
+        for warmup_step in range(args.warmup_steps):
+            zero_grad_all()
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    warmup_loss = model(x, y, step_frac=0.0)
+                (warmup_loss * grad_scale).backward()
+            opt_muon.step(); opt_adam.step()
+            if master_process and (warmup_step + 1) % 10 == 0:
+                print(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip([opt_muon, opt_adam], initial_optimizer_states):
+            opt.load_state_dict(state)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        ema = EMA(base_model, args.ema_decay)
+
+    training_time_ms, step = 0.0, 0; t0 = time.perf_counter()
+
     grad_accum_steps = 32 // world_size; grad_scale = 1.0 / grad_accum_steps
 
     while True:
