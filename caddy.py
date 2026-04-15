@@ -315,7 +315,8 @@ class CaddyApp(App):
         vocab_size = "8192" if is_sp8192 else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
         
-        # Paths relative to project root
+        # When running from the experiment dir, data/token paths need to be relative to it
+        # or absolute. Using absolute paths from PROJECT_ROOT is safest.
         data_path = (PROJECT_ROOT / "data" / "datasets" / f"fineweb10B_{variant}").resolve()
         token_path = (PROJECT_ROOT / "data" / "tokenizers" / model_file).resolve()
         
@@ -326,30 +327,32 @@ class CaddyApp(App):
         is_ttt = "TTT" in exp_name_upper
         ttt_flag = "1" if is_ttt else "0"
         
-        # Use the specific train_gpt.py in the experiment folder if it exists, otherwise fall back to root
-        script_path = exp['path'] / "train_gpt.py"
-        if not script_path.exists():
-            script_path = PROJECT_ROOT / "train_gpt.py"
-        
-        # Construct the command string exactly as it would be typed in a shell
-        # We pass it as a single argument to 'task'
-        cmd_str = (
-            f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 "
-            f"RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size} "
-            f"torchrun --standalone --nproc_per_node=1 {script_path}"
+        # The script is in the current directory once we cd
+        script_name = "train_gpt.py"
+        if not (exp['path'] / script_name).exists():
+            # If no local script, we can't easily run it with this strategy 
+            # unless we copy it or point to root.
+            script_path = (PROJECT_ROOT / script_name).resolve()
+        else:
+            script_path = script_name
+
+        # Construct the command like the original CLI did: cd {path} && {env} {cmd}
+        env_str = (
+            f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} RUN_ID={exp['name']} "
+            f"DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}"
         )
-        
-        # Use a list for subprocess.run to avoid shell escaping issues
-        task_args = ["task", "-G", "1", "-m", "45", "-n", exp['name'], cmd_str]
+        # Original used 'ts' (task spooler), user is using 'task'
+        # Matching original CLI pattern of cd-then-run
+        run_cmd = f"task -G 1 -m 45 -n {exp['name']} \"{env_str} torchrun --standalone --nproc_per_node=1 {script_path}\""
         
         def run_it(interactive: bool = True):
             if interactive:
                 os.system("clear")
                 print(f"🚀 Launching experiment: {exp['name']}\n")
-                print(f"Command:\n{' '.join(task_args)}\n")
+                print(f"Command:\n{run_cmd}\n")
             
-            # Use shell=False (default) and the list of args for maximum robustness
-            subprocess.run(task_args, cwd=PROJECT_ROOT)
+            # Execute exactly like the original CLI
+            subprocess.run(f"cd {exp['path']} && {run_cmd}", shell=True)
             
             if interactive:
                 print("\n[bold green]✅ Task submitted to queue.[/bold green]")
