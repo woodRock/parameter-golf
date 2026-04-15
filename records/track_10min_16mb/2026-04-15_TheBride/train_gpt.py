@@ -659,9 +659,12 @@ def main():
 
     base_model = GPT(args).to(device).bfloat16()
     n_params = sum(p.numel() for p in base_model.parameters())
+    grad_accum_steps = 32 // world_size; grad_scale = 1.0 / grad_accum_steps
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{args.embed_lr if not args.tie_embeddings else args.tied_embed_lr} head_lr:{args.head_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
     log0(f"seed:{args.seed}")
 
@@ -676,8 +679,6 @@ def main():
     
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     ema = EMA(base_model, args.ema_decay)
-
-    grad_accum_steps = 32 // world_size; grad_scale = 1.0 / grad_accum_steps
 
     def zero_grad_all() -> None:
         for opt in [opt_muon, opt_adam]:
