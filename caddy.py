@@ -306,9 +306,11 @@ class CaddyApp(App):
             self.notify("Leaderboard is read-only.", severity="info")
 
     def launch_experiment(self, exp):
-        # Case-insensitive check for SP8192
+        # Case-insensitive check for SP8192 or specific known models like "Bride"
         exp_name_upper = exp['name'].upper()
-        is_sp8192 = "SP8192" in exp_name_upper or "8192" in exp_name_upper
+        # Explicit check for "The_Bride" or "BRIDE" as these should always be 8192
+        is_sp8192 = "SP8192" in exp_name_upper or "8192" in exp_name_upper or "BRIDE" in exp_name_upper
+        
         variant = "sp8192" if is_sp8192 else "sp1024"
         vocab_size = "8192" if is_sp8192 else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
@@ -329,24 +331,38 @@ class CaddyApp(App):
         if not script_path.exists():
             script_path = PROJECT_ROOT / "train_gpt.py"
         
-        run_cmd = f"bash -c 'export WANDB_ENABLED=1 && export TTT_ENABLED={ttt_flag} && export MAX_WALLCLOCK_SECONDS=4800 && export RUN_ID={exp['name']} && export DATA_PATH={data_path} && export TOKENIZER_PATH={token_path} && export VOCAB_SIZE={vocab_size} && torchrun --standalone --nproc_per_node=1 {script_path}'"
-        task_cmd = f"task -G 1 -m 45 -n {exp['name']} \"{run_cmd}\""
+        # Simplified quoting: avoid nested bash -c if possible, or use cleaner quoting
+        # The 'task' command itself likely handles the arguments. 
+        # We pass variables as a single string of exports + command.
+        env_vars = f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}"
+        torch_cmd = f"torchrun --standalone --nproc_per_node=1 {script_path}"
         
-        def run_it():
-            os.system("clear")
-            print(f"🚀 Launching experiment: {exp['name']}\n")
-            print(f"Command:\n{task_cmd}\n")
+        # Construct the final command string without double-wrapping in bash -c if task supports it
+        # Based on the error log, it seems the runner is wrapping our command in yet another bash -c.
+        final_run_cmd = f"{env_vars} {torch_cmd}"
+        task_cmd = f"task -G 1 -m 45 -n {exp['name']} '{final_run_cmd}'"
+        
+        def run_it(interactive: bool = True):
+            if interactive:
+                os.system("clear")
+                print(f"🚀 Launching experiment: {exp['name']}\n")
+                print(f"Command:\n{task_cmd}\n")
+            
             # We run the task from the project root but point it at the experiment's script
             subprocess.run(task_cmd, shell=True, cwd=PROJECT_ROOT)
-            print("\n[bold green]✅ Task submitted to queue.[/bold green]")
-            input("\nPress Enter to return to Caddy...")
+            
+            if interactive:
+                print("\n[bold green]✅ Task submitted to queue.[/bold green]")
+                print("\nPress Enter to return to Caddy...")
+                sys.stdin.readline()
 
         # suspend_process is available in Textual 0.49.0+
         if hasattr(self, "suspend_process"):
             self.suspend_process(run_it)
         else:
-            # Fallback for older Textual versions
-            run_it()
+            # Fallback for older Textual: run without blocking input to avoid hang
+            run_it(interactive=False)
+            self.notify(f"🚀 Queued: {exp['name']}", severity="info")
         
         self.action_refresh()
 
