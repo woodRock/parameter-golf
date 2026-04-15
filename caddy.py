@@ -331,24 +331,25 @@ class CaddyApp(App):
         if not script_path.exists():
             script_path = PROJECT_ROOT / "train_gpt.py"
         
-        # Construct environment variables and command
-        # We wrap the command in bash -c explicitly to ensure environment variables are handled correctly
-        inner_cmd = (
-            f"export WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 "
-            f"RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}; "
+        # Construct the command string exactly as it would be typed in a shell
+        # We pass it as a single argument to 'task'
+        cmd_str = (
+            f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} MAX_WALLCLOCK_SECONDS=4800 "
+            f"RUN_ID={exp['name']} DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size} "
             f"torchrun --standalone --nproc_per_node=1 {script_path}"
         )
-        # Use single quotes for the inner command to avoid shell expansion issues
-        task_cmd = f"task -G 1 -m 45 -n {exp['name']} \"bash -c '{inner_cmd}'\""
+        
+        # Use a list for subprocess.run to avoid shell escaping issues
+        task_args = ["task", "-G", "1", "-m", "45", "-n", exp['name'], cmd_str]
         
         def run_it(interactive: bool = True):
             if interactive:
                 os.system("clear")
                 print(f"🚀 Launching experiment: {exp['name']}\n")
-                print(f"Command:\n{task_cmd}\n")
+                print(f"Command:\n{' '.join(task_args)}\n")
             
-            # We run the task from the project root but point it at the experiment's script
-            subprocess.run(task_cmd, shell=True, cwd=PROJECT_ROOT)
+            # Use shell=False (default) and the list of args for maximum robustness
+            subprocess.run(task_args, cwd=PROJECT_ROOT)
             
             if interactive:
                 print("\n[bold green]✅ Task submitted to queue.[/bold green]")
