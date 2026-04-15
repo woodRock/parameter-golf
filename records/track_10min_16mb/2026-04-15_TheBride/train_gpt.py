@@ -495,6 +495,13 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor: return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
+def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
