@@ -641,6 +641,8 @@ def main():
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     ema = EMA(base_model, args.ema_decay)
 
+    grad_accum_steps = 32 // world_size; grad_scale = 1.0 / grad_accum_steps
+
     def zero_grad_all() -> None:
         for opt in [opt_muon, opt_adam]:
             opt.zero_grad(set_to_none=True)
@@ -669,9 +671,8 @@ def main():
 
     training_time_ms, step = 0.0, 0; t0 = time.perf_counter()
 
-    grad_accum_steps = 32 // world_size; grad_scale = 1.0 / grad_accum_steps
-
     while True:
+
         last_step = step == args.iterations or (training_time_ms >= args.max_wallclock_seconds * 1000)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize(); training_time_ms += 1000.0 * (time.perf_counter() - t0)
