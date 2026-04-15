@@ -336,20 +336,15 @@ class CaddyApp(App):
         else:
             script_path = script_name
 
-        # Construct the command using a very explicit bash -c wrapper
-        # This ensures the environment is set correctly within the task runner's environment
-        inner_torch_cmd = f"torchrun --standalone --nproc_per_node=1 {script_path}"
-        env_vars_export = (
-            f"export WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} RUN_ID={exp['name']} "
+        # Build the command exactly as it would be typed in a shell
+        # Environment variables are passed directly before the command, with no extra quotes
+        env_str = (
+            f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} RUN_ID={exp['name']} "
             f"DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}"
         )
-        
-        # Combine them into a single string that task will execute
-        # Wrapping in bash -c '...' is the most robust way to pass multiple commands and env vars
-        full_run_cmd = f"bash -c '{env_vars_export} && {inner_torch_cmd}'"
-        
-        # The final task command
-        run_cmd = f"task -G 1 -m 45 -n {exp['name']} \"{full_run_cmd}\""
+        # We don't wrap the inner command in quotes because 'task' (or 'ts') 
+        # usually wants the command and its arguments as separate words.
+        run_cmd = f"task -G 1 -m 45 -n {exp['name']} {env_str} torchrun --standalone --nproc_per_node=1 {script_path}"
         
         def run_it(interactive: bool = True):
             if interactive:
