@@ -306,7 +306,9 @@ class CaddyApp(App):
             self.notify("Leaderboard is read-only.", severity="info")
 
     def launch_experiment(self, exp):
-        is_sp8192 = "SP8192" in exp['name']
+        # Case-insensitive check for SP8192
+        exp_name_upper = exp['name'].upper()
+        is_sp8192 = "SP8192" in exp_name_upper or "8192" in exp_name_upper
         variant = "sp8192" if is_sp8192 else "sp1024"
         vocab_size = "8192" if is_sp8192 else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
@@ -319,7 +321,7 @@ class CaddyApp(App):
             self.notify(f"Data directory not found: {data_path}", severity="error")
             return
 
-        is_ttt = "TTT" in exp['name']
+        is_ttt = "TTT" in exp_name_upper
         ttt_flag = "1" if is_ttt else "0"
         
         # Use the specific train_gpt.py in the experiment folder if it exists, otherwise fall back to root
@@ -339,7 +341,13 @@ class CaddyApp(App):
             print("\n[bold green]✅ Task submitted to queue.[/bold green]")
             input("\nPress Enter to return to Caddy...")
 
-        self.suspend_process(run_it)
+        # suspend_process is available in Textual 0.49.0+
+        if hasattr(self, "suspend_process"):
+            self.suspend_process(run_it)
+        else:
+            # Fallback for older Textual versions
+            run_it()
+        
         self.action_refresh()
 
 if __name__ == "__main__":
