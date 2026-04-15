@@ -746,7 +746,10 @@ def main():
 
     if master_process:
         quant_obj = quantize_state_dict_int8(ema.model.state_dict(), args.clip_k_matrix, args.clip_k_embed)
-        with open("final_model.int8.ptz", "wb") as f: f.write(zlib.compress(io.BytesIO(torch.save(quant_obj, io.BytesIO()).getvalue()).getvalue(), level=9))
+        buf = io.BytesIO()
+        torch.save(quant_obj, buf)
+        with open("final_model.int8.ptz", "wb") as f:
+            f.write(zlib.compress(buf.getvalue(), level=9))
         
     if distributed: dist.barrier()
     with open("final_model.int8.ptz", "rb") as f: q_state = torch.load(io.BytesIO(zlib.decompress(f.read())), map_location="cpu")
