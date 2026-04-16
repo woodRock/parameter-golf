@@ -6,7 +6,7 @@ Uses huggingface_hub (handles LFS correctly, unlike raw curl).
 Usage:
     python3 download_sp8192.py [--train-shards N]
 
-Default: downloads all 180 training shards + 1 val shard + tokenizer.
+Default: downloads all 128 training shards + 1 val shard + tokenizer.
 """
 
 import argparse
@@ -46,8 +46,8 @@ def get(subfolder: str, filename: str, dest: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download SP8192 data from kevclark/parameter-golf")
-    parser.add_argument("--train-shards", type=int, default=180,
-                        help="Number of training shards to download (default: 180)")
+    parser.add_argument("--train-shards", type=int, default=128,
+                        help="Number of training shards to download (default: 128)")
     args = parser.parse_args()
 
     print(f"Repo:         {REPO}")
