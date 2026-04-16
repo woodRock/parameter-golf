@@ -1,0 +1,7 @@
+flash-attn
+triton
+sentencepiece
+numpy
+torch
+brotli
+pyminify

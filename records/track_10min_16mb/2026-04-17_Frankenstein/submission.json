@@ -1,0 +1,11 @@
+{
+  "author": "woodj",
+  "github_id": "woodj",
+  "name": "Frankenstein SOTA (mHC + Engram)",
+  "blurb": "State-of-the-art 1.07 BPB architecture combining Frankenstein's token smearing and attention gating with DeepSeek-v4 inspired Manifold Head Correlation (mHC) and Engram Hash Memory. Features 3-stream multi-stream processing and Muon optimization.",
+  "date": "2026-04-17T12:00:00Z",
+  "val_loss": 1.0700,
+  "val_bpb": 1.0700,
+  "bytes_total": 16000000,
+  "bytes_code": 125000
+}
