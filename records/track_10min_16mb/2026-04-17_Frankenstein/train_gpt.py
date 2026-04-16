@@ -74,6 +74,12 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.095))
     embed_wd = float(os.environ.get("EMBED_WD", 0.085))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    # DeepSeek-v4: mHC & Engram
+    num_mhc_streams = int(os.environ.get("NUM_MHC_STREAMS", 3))
+    mhc_sinkhorn_iters = int(os.environ.get("MHC_SINKHORN_ITERS", 5))
+    engram_table_size = int(os.environ.get("ENGRAM_TABLE_SIZE", 524288))
+    engram_dim = int(os.environ.get("ENGRAM_DIM", 4))
+    engram_lr = float(os.environ.get("ENGRAM_LR", 0.01))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
@@ -203,6 +209,39 @@ def build_sentencepiece_luts(sp, vocab_size, device):
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+class EngramMemory(nn.Module):
+    def __init__(self, table_size, embed_dim, output_dim):
+        super().__init__()
+        self.table_size = table_size
+        self.embedding = nn.Embedding(table_size, embed_dim)
+        self.proj = CastedLinear(embed_dim, output_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, input_ids):
+        # Bigram hash: (current_token * 8191 + prev_token) % table_size
+        B, T = input_ids.shape
+        prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        hash_idx = (input_ids * 8191 + prev_ids) % self.table_size
+        engram = self.embedding(hash_idx)
+        return self.proj(engram)
+
+
+class ManifoldMixer(nn.Module):
+    def __init__(self, k, iters=5):
+        super().__init__()
+        self.k = k
+        self.iters = iters
+        self.weights = nn.Parameter(torch.eye(k, dtype=torch.float32))
+
+    def forward(self, x):
+        # x shape: (B, T, K, D)
+        W = self.weights.exp()
+        for _ in range(self.iters):
+            W = W / W.sum(dim=1, keepdim=True)
+            W = W / W.sum(dim=0, keepdim=True)
+        return torch.einsum("btkd,kl->btld", x, W.to(x.dtype))
 
 
 def load_validation_tokens(pattern, seq_len):
@@ -745,6 +784,8 @@ class Block(nn.Module):
         gate_mlp_out=False,
         gate_attn_src="proj",
         gate_width=12,
+        num_streams=3,
+        sinkhorn_iters=5,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -760,21 +801,30 @@ class Block(nn.Module):
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.mixer = ManifoldMixer(num_streams, sinkhorn_iters)
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
+        # x is (B, T, K, D)
         mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        s0, s1 = x[:, :, 0], x[:, :, 1]
+
+        x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         attn_out = self.attn(
             self.attn_norm(x_in) * self.ln_scale_factor,
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
-            None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        return x_out
+        h0 = self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+
+        h1 = self.mlp(self.mlp_norm(s1) * self.ln_scale_factor, up_w, down_w)
+        h1 = self.mlp_scale.to(dtype=s1.dtype)[None, None, :] * h1
+
+        delta = torch.zeros_like(x)
+        delta[:, :, 0] = h0
+        delta[:, :, 1] = h1
+
+        return self.mixer(x + delta)
 
 class GPT(nn.Module):
     def __init__(self, h):
@@ -785,6 +835,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
+        self.engram = EngramMemory(h.engram_table_size, h.engram_dim, h.model_dim)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
             self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
@@ -818,6 +869,8 @@ class GPT(nn.Module):
                     gate_mlp_out=h.gate_mlp_out,
                     gate_attn_src=h.gate_attn_src,
                     gate_width=h.gate_width,
+                    num_streams=h.num_mhc_streams,
+                    sinkhorn_iters=h.mhc_sinkhorn_iters,
                 )
                 for i in range(h.num_layers)
             ]
@@ -891,6 +944,7 @@ class GPT(nn.Module):
     def _init_weights(self):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.engram.embedding.weight, mean=0.0, std=self.tied_embed_init_std)
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         for i in range(n):
@@ -931,24 +985,38 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        # Use streams from lanes
+        s0_l0 = lane0[:, :, 0]
+        s1_l1 = lane1[:, :, 1]
+
+        attn_read = mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
         )
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        mlp_read = lane1
+        
+        mlp_read = s1_l1
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
             block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
         )
+        
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
-        lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
-        return lane0, lane1
+        
+        # Mix into streams
+        lane0 = attn_resid * lane0
+        lane0[:, :, 0] = lane0[:, :, 0] + attn_post[0] * attn_out
+        lane0[:, :, 1] = lane0[:, :, 1] + mlp_post[0] * mlp_out
+        
+        lane1 = mlp_resid * lane1
+        lane1[:, :, 0] = lane1[:, :, 0] + attn_post[1] * attn_out
+        lane1[:, :, 1] = lane1[:, :, 1] + mlp_post[1] * mlp_out
+        
+        return block.mixer(lane0), block.mixer(lane1)
 
     def _final_parallel_hidden(self, lane0, lane1):
         if self.parallel_final_lane == "mlp":
@@ -958,16 +1026,21 @@ class GPT(nn.Module):
         return 0.5 * (lane0 + lane1)
 
     def forward_logits(self, input_ids, cu_seqlens=None, max_seqlen=0):
-        x = self.tok_emb(input_ids)
+        x_emb = self.tok_emb(input_ids)
         if self.smear_gate_enabled:
             # smear token embed forward 1 position (@classiclarryd, modded-nanogpt 2025-09-18)
-            sl = self.smear_lambda.to(dtype=x.dtype)
-            g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, : self.smear_width]))
-            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
-        x = F.rms_norm(x, (x.size(-1),))
+            sl = self.smear_lambda.to(dtype=x_emb.dtype)
+            g = sl * torch.sigmoid(self.smear_gate(x_emb[:, 1:, : self.smear_width]))
+            x_emb = torch.cat([x_emb[:, :1], x_emb[:, 1:] + g * x_emb[:, :-1]], dim=1)
+        x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
         if self.embed_proj is not None:
-            x = self.embed_proj(x)
-        x0 = x
+            x_emb = self.embed_proj(x_emb)
+        
+        x_mem = self.engram(input_ids)
+        # x is (B, T, K, D)
+        # s0: embedding, s1: engram, s2: identity/residual
+        x = torch.stack([x_emb, x_mem, torch.zeros_like(x_emb)], dim=2)
+        x0 = x_emb
         skips = []
         enc_iter = (
             self.encoder_indices
@@ -997,9 +1070,9 @@ class GPT(nn.Module):
                     lane1 = x
                 if skip_idx < self.num_skip_weights and skips:
                     skip = skips.pop()
-                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, None, :]
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, None, :]
                         lane0 = torch.lerp(w * skip, lane0, g)
                     else:
                         lane0 = lane0 + w * skip
@@ -1010,18 +1083,19 @@ class GPT(nn.Module):
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
+                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, None, :]
                         * skips.pop()
                     )
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, None, :]
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
                 x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
-        x = self.final_norm(x)
+        # DeepSeek-v4: Extract final output from primary stream (0)
+        x = self.final_norm(x[:, :, 0])
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
@@ -1041,15 +1115,20 @@ class GPT(nn.Module):
         )
 
     def forward_ttt(self, input_ids, target_ids, lora):
-        x = self.tok_emb(input_ids)
+        x_emb = self.tok_emb(input_ids)
         if self.smear_gate_enabled:
-            sl = self.smear_lambda.to(dtype=x.dtype)
-            g = sl * torch.sigmoid(self.smear_gate(x[:, 1:, : self.smear_width]))
-            x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1]], dim=1)
-        x = F.rms_norm(x, (x.size(-1),))
+            sl = self.smear_lambda.to(dtype=x_emb.dtype)
+            g = sl * torch.sigmoid(self.smear_gate(x_emb[:, 1:, : self.smear_width]))
+            x_emb = torch.cat([x_emb[:, :1], x_emb[:, 1:] + g * x_emb[:, :-1]], dim=1)
+        x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
         if self.embed_proj is not None:
-            x = self.embed_proj(x)
-        x0 = x
+            x_emb = self.embed_proj(x_emb)
+        
+        x_mem = self.engram(input_ids)
+        # x is (B, T, K, D)
+        # s0: embedding, s1: engram, s2: identity/residual
+        x = torch.stack([x_emb, x_mem, torch.zeros_like(x_emb)], dim=2)
+        x0 = x_emb
         skips = []
         enc_iter = (
             self.encoder_indices
@@ -1083,9 +1162,9 @@ class GPT(nn.Module):
                     lane1 = x
                 if skip_idx < self.num_skip_weights and skips:
                     skip = skips.pop()
-                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
+                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, None, :]
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, None, :]
                         lane0 = torch.lerp(w * skip, lane0, g)
                     else:
                         lane0 = lane0 + w * skip
@@ -1096,11 +1175,11 @@ class GPT(nn.Module):
             else:
                 if skip_idx < self.num_skip_weights and skips:
                     scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
+                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, None, :]
                         * skips.pop()
                     )
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, None, :]
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
@@ -1108,7 +1187,8 @@ class GPT(nn.Module):
             slot += 1
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
-        x = self.final_norm(x)
+        # Extract stream 0
+        x = self.final_norm(x[:, :, 0])
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
@@ -1124,7 +1204,8 @@ class GPT(nn.Module):
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
         mix = block.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        s0, s1 = x[:, :, 0], x[:, :, 1]
+        x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
@@ -1155,13 +1236,18 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        mlp_n = block.mlp_norm(x_out) * block.ln_scale_factor
+        h0 = block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        
+        mlp_n = block.mlp_norm(s1) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        x_out = x_out + block.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
-        return x_out
+        h1 = block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        
+        delta = torch.zeros_like(x)
+        delta[:, :, 0] = h0
+        delta[:, :, 1] = h1
+        return block.mixer(x + delta)
 
     def _parallel_block_with_lora(
         self, block_idx, lane0, lane1, x0, lora, slot,
@@ -1169,8 +1255,10 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
-        n = block.attn_norm(attn_read) * block.ln_scale_factor
+        s0_l0 = lane0[:, :, 0]
+        s1_l1 = lane1[:, :, 1]
+        
+        n = block.attn_norm(mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
         q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
@@ -1201,19 +1289,28 @@ class GPT(nn.Module):
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
-        mlp_read = lane1
-        mlp_n = block.mlp_norm(mlp_read) * block.ln_scale_factor
+        
+        mlp_n = block.mlp_norm(s1_l1) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+        
         attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
         mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        lane0 = attn_resid * lane0 + attn_post[0] * attn_out + mlp_post[0] * mlp_out
-        lane1 = mlp_resid * lane1 + attn_post[1] * attn_out + mlp_post[1] * mlp_out
-        return lane0, lane1
+        
+        # Mix into streams
+        lane0 = attn_resid * lane0
+        lane0[:, :, 0] = lane0[:, :, 0] + attn_post[0] * attn_out
+        lane0[:, :, 1] = lane0[:, :, 1] + mlp_post[0] * mlp_out
+        
+        lane1 = mlp_resid * lane1
+        lane1[:, :, 0] = lane1[:, :, 0] + attn_post[1] * attn_out
+        lane1[:, :, 1] = lane1[:, :, 1] + mlp_post[1] * mlp_out
+        
+        return block.mixer(lane0), block.mixer(lane1)
 
 
 class BatchedLinearLoRA(nn.Module):
@@ -1461,7 +1558,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,mlp_gate_proj,smear_gate,smear_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,mlp_gate_proj,smear_gate,smear_lambda,mixer.weights,engram.proj",
     ).split(",")
     if pattern
 )
@@ -1493,6 +1590,16 @@ class Optimizers:
             scalar_params.append(base_model.parallel_post_lambdas)
         if base_model.parallel_resid_lambdas is not None:
             scalar_params.append(base_model.parallel_resid_lambdas)
+        
+        # Add engram project to scalar params
+        engram_named_params = list(base_model.engram.named_parameters())
+        for name, p in engram_named_params:
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                if not any(p is sp for sp in scalar_params):
+                    scalar_params.append(p)
+        
+        engram_embed_params = [p for n, p in engram_named_params if "embedding" in n]
+
         # Gate Linears (attn_gate_proj / mlp_gate_proj) are pulled into
         # scalar_params automatically via CONTROL_TENSOR_NAME_PATTERNS.
         # Same pattern as train_experiment.py: gates share scalar_lr=0.02.
@@ -1518,7 +1625,10 @@ class Optimizers:
         for group in self.optimizer_muon.param_groups:
             group["base_lr"] = h.matrix_lr
         self.optimizer_scalar = torch.optim.AdamW(
-            [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
+            [
+                {"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr},
+                {"params": engram_embed_params, "lr": h.engram_lr, "base_lr": h.engram_lr}
+            ],
             betas=(h.beta1, h.beta2),
             eps=h.adam_eps,
             weight_decay=h.adam_wd,
@@ -1547,6 +1657,7 @@ class Optimizers:
             self.optimizer_head = None
         self.replicated_params = list(tok_params[0]["params"])
         self.replicated_params.extend(scalar_params)
+        self.replicated_params.extend(engram_embed_params)
         if base_model.lm_head is not None:
             self.replicated_params.append(base_model.lm_head.weight)
         self.replicated_large_params = []
@@ -1762,7 +1873,7 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     meta = {}
     for (name, tensor) in state_dict.items():
         t = tensor.detach().cpu().contiguous()
-        if not t.is_floating_point() or t.numel() <= 65536:
+        if not t.is_floating_point() or t.numel() <= 65536 or "engram.embedding" in name:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough (float16)"
             continue
