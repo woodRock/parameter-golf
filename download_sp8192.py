@@ -17,8 +17,8 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 REPO = "kevclark/parameter-golf"
-REMOTE_DATASET = "datasets/fineweb10B_sp8192"
-REMOTE_TOKENIZER = "tokenizers"
+REMOTE_DATASET = "datasets/datasets/fineweb10B_sp8192"
+REMOTE_TOKENIZER = "datasets/tokenizers"
 
 DATA_DIR = Path("data/datasets/fineweb10B_sp8192")
 TOK_DIR = Path("data/tokenizers")
