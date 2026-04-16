@@ -35,23 +35,7 @@ State-of-the-art implementation for the 10-minute 16MB Parameter Golf challenge.
 To replicate the SOTA results (e.g., across seeds 7, 42, 1337), run the following command on an 8xH100 node:
 
 ```bash
-SEED=1337 \
-RUN_ID=frankenstein_1337 \
-VOCAB_SIZE=8192 \
-DATA_DIR=./data/ \
-SMEAR_GATE=1 \
-SMEAR_GATE_WIDTH=12 \
-GATE_ATTN_OUT=1 \
-GATE_ATTN_SRC=proj \
-GATE_WIDTH=12 \
-QK_GAIN_INIT=5.25 \
-TTT_ENABLED=1 \
-NUM_MHC_STREAMS=3 \
-MHC_SINKHORN_ITERS=5 \
-ENGRAM_TABLE_SIZE=524288 \
-ENGRAM_DIM=4 \
-ENGRAM_LR=0.01 \
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+SEED=1337 RUN_ID=frankenstein_sp8192 VOCAB_SIZE=8192 DATA_DIR=./data/ SMEAR_GATE=1 SMEAR_GATE_WIDTH=12 GATE_ATTN_OUT=1 GATE_ATTN_SRC=proj GATE_WIDTH=12 QK_GAIN_INIT=5.25 TTT_ENABLED=1 NUM_MHC_STREAMS=3 MHC_SINKHORN_ITERS=5 ENGRAM_TABLE_SIZE=524288 ENGRAM_DIM=4 ENGRAM_LR=0.01 torchrun --standalone --nproc_per_node=8 records/track_10min_16mb/2026-04-17_Frankenstein/train_gpt.py
 ```
 
 ## Structure
