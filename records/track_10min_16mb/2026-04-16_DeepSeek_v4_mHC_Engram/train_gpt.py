@@ -54,14 +54,13 @@ class Hyperparameters:
         self.iterations = int(os.environ.get("ITERATIONS", 20000))
         self.warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
         self.warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-        self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+        self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 2097152))
         self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
         self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 4800.0))
 
-
-        # Model shape (Faithful to bigbag)
+        # Model shape (DeepSeek-v4 Style)
         self.vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
-        self.num_layers = int(os.environ.get("NUM_LAYERS", 11))
+        self.num_layers = int(os.environ.get("NUM_LAYERS", 12)) # 12 layers
         self.num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
         self.model_dim = int(os.environ.get("MODEL_DIM", 512)) 
         self.num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -77,6 +76,8 @@ class Hyperparameters:
         self.tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
         self.matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
         self.scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+        self.engram_lr = float(os.environ.get("ENGRAM_LR", 0.01))
+
         self.muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
         self.muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
         self.muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -96,6 +97,12 @@ class Hyperparameters:
 
         # EMA hyperparameters
         self.ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+
+        # DeepSeek-v4: mHC & Engram
+        self.num_mhc_streams = int(os.environ.get("NUM_MHC_STREAMS", 3))
+        self.mhc_sinkhorn_iters = int(os.environ.get("MHC_SINKHORN_ITERS", 5))
+        self.engram_table_size = int(os.environ.get("ENGRAM_TABLE_SIZE", 524288))
+        self.engram_dim = int(os.environ.get("ENGRAM_DIM", 4))
 
         # Quantization hyperparameters (bigbag style)
         self.clip_k_matrix = 12.85
@@ -397,7 +404,7 @@ def eval_val_ttt(
 # POST-TRAINING QUANTIZATION (SDClip)
 # -----------------------------
 
-CONTROL_TENSOR_NAME_PATTERNS = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weight")
+CONTROL_TENSOR_NAME_PATTERNS = ("attn_scale", "mlp_scale", "resid_mix", "q_gain", "skip_weight", "mixer.weights", "engram.embedding")
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
@@ -429,7 +436,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], k_matrix: float, k_e
             passthrough[name] = t.half()
             passthrough_orig_dtypes[name] = "half"
             continue
-        k = k_embed if "tok_emb" in name else k_matrix
+        k = k_embed if ("tok_emb" in name or "engram.embedding" in name) else k_matrix
         q, s = quantize_float_tensor(t, k=k)
         if s.ndim > 0: qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name], scales[name], dtypes[name] = q, s, str(t.dtype).removeprefix("torch.")
@@ -486,6 +493,48 @@ class DistributedTokenLoader:
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
         return local[:-1].reshape(-1, seq_len).to(self.device), local[1:].reshape(-1, seq_len).to(self.device)
+
+# -----------------------------
+# DEEPSEEK-V4 INNOVATIONS
+# -----------------------------
+
+class EngramMemory(nn.Module):
+    def __init__(self, table_size: int, embed_dim: int, output_dim: int):
+        super().__init__()
+        self.table_size = table_size
+        self.embedding = nn.Embedding(table_size, embed_dim)
+        self.proj = nn.Linear(embed_dim, output_dim, bias=False)
+        self.proj._zero_init = True
+        
+    def forward(self, input_ids: Tensor) -> Tensor:
+        # Bigram hash: (prev_token * vocab_size + current_token) % table_size
+        # For simplicity, we use (token * constant + prev_token) % size
+        # We need a 'prev_token' sequence.
+        B, T = input_ids.shape
+        prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        # Use a simple primes for hashing
+        hash_idx = (input_ids * 8191 + prev_ids) % self.table_size
+        engram = self.embedding(hash_idx)
+        return self.proj(engram)
+
+class ManifoldMixer(nn.Module):
+    def __init__(self, k: int, iters: int = 5):
+        super().__init__()
+        self.k = k
+        self.iters = iters
+        self.weights = nn.Parameter(torch.eye(k)) # Start near identity
+        
+    def forward(self, x: Tensor) -> Tensor:
+        # x shape: (B, T, K, D)
+        # 1. Project to Birkhoff Polytope (Sinkhorn-Knopp)
+        W = self.weights.exp() # Ensure positivity
+        for _ in range(self.iters):
+            W = W / W.sum(dim=1, keepdim=True) # Row-wise normalization
+            W = W / W.sum(dim=0, keepdim=True) # Column-wise normalization
+            
+        # 2. Mix streams: x @ W
+        # x is (B, T, K, D), W is (K, K)
+        return torch.einsum("btkd,kl->btld", x, W)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -559,34 +608,45 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, layer_idx: int, parallel_residual_start: int):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, num_streams: int, sinkhorn_iters: int):
         super().__init__()
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale, self.mlp_scale = nn.Parameter(torch.ones(dim)), nn.Parameter(torch.ones(dim))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.is_parallel = layer_idx >= parallel_residual_start
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        if self.is_parallel:
-            x_norm = self.attn_norm(x)
-            x = x + self.attn_scale.to(x.dtype) * self.attn(x_norm) + self.mlp_scale.to(x.dtype) * self.mlp(self.mlp_norm(x))
-        else:
-            h = x + self.attn_scale.to(x.dtype) * self.attn(self.attn_norm(x))
-            x = h + self.mlp_scale.to(x.dtype) * self.mlp(self.mlp_norm(h))
-        return x
+        self.mixer = ManifoldMixer(num_streams, sinkhorn_iters)
+        
+    def forward(self, x: Tensor) -> Tensor:
+        # x is (B, T, K, D)
+        # Apply specialized logic to streams
+        # Stream 0: Attention-heavy
+        # Stream 1: MLP-heavy
+        # Stream 2: Identity / Memory-heavy
+        
+        # Parallel updates to streams
+        s0 = x[:, :, 0]
+        s1 = x[:, :, 1]
+        
+        # Attention on s0
+        h0 = self.attn(self.attn_norm(s0))
+        # MLP on s1
+        h1 = self.mlp(self.mlp_norm(s1))
+        
+        # Create delta tensor
+        # We only update streams 0 and 1 here, stream 2 remains identity for mixing
+        delta = torch.zeros_like(x)
+        delta[:, :, 0] = h0
+        delta[:, :, 1] = h1
+        
+        # Residual + Mix
+        return self.mixer(x + delta)
 
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
         self.h = h
         self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
-        self.num_encoder_layers = h.num_layers // 2
-        self.num_decoder_layers = h.num_layers - self.num_encoder_layers
-        self.skip_weights = nn.Parameter(torch.ones(min(self.num_encoder_layers, self.num_decoder_layers), h.model_dim))
-        self.blocks = nn.ModuleList([Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base, h.qk_gain_init, i, h.parallel_residual_start) for i in range(h.num_layers)])
+        self.engram = EngramMemory(h.engram_table_size, h.engram_dim, h.model_dim)
+        self.blocks = nn.ModuleList([Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base, h.qk_gain_init, h.num_mhc_streams, h.mhc_sinkhorn_iters) for i in range(h.num_layers)])
         self.final_norm = RMSNorm()
         self._init_weights()
     def _init_weights(self):
@@ -596,20 +656,31 @@ class GPT(nn.Module):
                 if getattr(m, "_zero_init", False): nn.init.zeros_(m.weight)
                 else: nn.init.orthogonal_(m.weight)
     def forward(self, input_ids: Tensor, target_ids: Tensor, step_frac: float = 0.0, is_eval: bool = False) -> Tensor:
-        x = F.rms_norm(self.tok_emb(input_ids), (self.h.model_dim,))
-        x0, skips = x, []
-        # Recurrence activation logic
+        x_emb = self.tok_emb(input_ids)
+        x_mem = self.engram(input_ids)
+        # Initialize k-stream state
+        # s0: embedding, s1: engram, s2: identity/residual
+        # Each stream (B, T, D)
+        x = torch.stack([x_emb, x_mem, torch.zeros_like(x_emb)], dim=2)
+        
+        # Recurrence logic (The Bride style)
+        num_enc = self.h.num_layers // 2
         recurrence_active = step_frac >= self.h.recurrence_start_frac
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            if i == self.num_encoder_layers - 1 and self.num_encoder_layers >= 3 and recurrence_active:
-                for j in range(self.num_encoder_layers - 3, self.num_encoder_layers): x = self.blocks[j](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips: x = x + self.skip_weights[i].to(x.dtype) * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x).reshape(-1, self.h.model_dim)
-        logits = self.h.logit_softcap * torch.tanh(F.linear(x, self.tok_emb.weight) / self.h.logit_softcap)
+        
+        # Encoder Blocks
+        for i in range(num_enc):
+            x = self.blocks[i](x)
+            if i == num_enc - 1 and num_enc >= 3 and recurrence_active:
+                for j in range(num_enc - 3, num_enc): x = self.blocks[j](x)
+                
+        # Decoder Blocks
+        for i in range(num_enc, self.h.num_layers):
+            x = self.blocks[i](x)
+            
+        # Final output from primary stream (0) mixed with others
+        # For simplicity, we just use Stream 0 which should be the core reasoning stream
+        x_out = self.final_norm(x[:, :, 0]).reshape(-1, self.h.model_dim)
+        logits = self.h.logit_softcap * torch.tanh(F.linear(x_out, self.tok_emb.weight) / self.h.logit_softcap)
         return F.cross_entropy(logits.float(), target_ids.reshape(-1))
 
 # -----------------------------
@@ -682,8 +753,16 @@ def main():
     
     matrix_params = [p for n, p in base_model.named_parameters() if p.ndim == 2 and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
     scalar_params = [p for n, p in base_model.named_parameters() if p.ndim < 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+    
+    # Engram embedding needs Adam, usually with a lower LR than the rest
+    engram_params = [p for n, p in base_model.named_parameters() if "engram.embedding" in n]
+    scalar_params = [p for p in scalar_params if not any(p is ep for ep in engram_params)]
+    
     opt_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
-    opt_adam = torch.optim.Adam([{"params": scalar_params + [base_model.tok_emb.weight], "lr": args.matrix_lr}], betas=(0.9, 0.95), fused=True)
+    opt_adam = torch.optim.Adam([
+        {"params": scalar_params + [base_model.tok_emb.weight], "lr": args.matrix_lr},
+        {"params": engram_params, "lr": args.engram_lr}
+    ], betas=(0.9, 0.95), fused=True)
     
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     ema = EMA(base_model, args.ema_decay)
