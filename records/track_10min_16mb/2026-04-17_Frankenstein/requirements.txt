@@ -4,4 +4,4 @@ sentencepiece
 numpy
 torch
 brotli
-pyminify
+python-minifier

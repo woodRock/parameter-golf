@@ -17,6 +17,7 @@ State-of-the-art implementation for the 10-minute 16MB Parameter Golf challenge.
    ```bash
    pip install -r requirements.txt
    ```
+   *Note: `pyminify` is used for code size calculation but the script will fall back to raw code if it's not installed.*
 
 2. **Caddy Installation**:
    If you need to install the `caddy` networking tool used in the experiments:

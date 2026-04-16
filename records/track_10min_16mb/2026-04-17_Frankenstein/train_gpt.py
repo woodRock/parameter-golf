@@ -2041,10 +2041,26 @@ def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
 
 def _compressed_code_size(code):
     code_raw = code.encode("utf-8")
-    minified = subprocess.run(
-        ["pyminify", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
-        input=code_raw, capture_output=True, check=True,
-    ).stdout
+    minified = None
+    # Try pyminify command
+    try:
+        minified = subprocess.run(
+            ["pyminify", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
+            input=code_raw, capture_output=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Try python -m python_minifier
+        try:
+            minified = subprocess.run(
+                [sys.executable, "-m", "python_minifier", "--no-rename-locals", "--no-hoist-literals", "--remove-literal-statements", "-"],
+                input=code_raw, capture_output=True, check=True,
+            ).stdout
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    
+    if minified is None:
+        minified = code_raw
+
     compressed = lzma.compress(minified)
     encoded = base64.b85encode(compressed)
     wrapper = b'import lzma as L,base64 as B\nexec(L.decompress(B.b85decode("' + encoded + b'")))\n'
