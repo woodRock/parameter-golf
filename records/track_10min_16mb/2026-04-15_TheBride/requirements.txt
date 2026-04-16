@@ -1,5 +1,0 @@
-numpy
-sentencepiece
-torch
-wandb
-brotli
