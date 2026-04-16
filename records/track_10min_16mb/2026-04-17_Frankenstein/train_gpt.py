@@ -806,7 +806,7 @@ class Block(nn.Module):
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
         # x is (B, T, K, D)
         mix = self.resid_mix.to(dtype=x.dtype)
-        s0, s1 = x[:, :, 0], x[:, :, 1]
+        s0, s1, s2 = x[:, :, 0], x[:, :, 1], x[:, :, 2]
 
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         attn_out = self.attn(
@@ -820,11 +820,10 @@ class Block(nn.Module):
         h1 = self.mlp(self.mlp_norm(s1) * self.ln_scale_factor, up_w, down_w)
         h1 = self.mlp_scale.to(dtype=s1.dtype)[None, None, :] * h1
 
-        delta = torch.zeros_like(x)
-        delta[:, :, 0] = h0
-        delta[:, :, 1] = h1
-
-        return self.mixer(x + delta)
+        # DeepSeek-v4: Update streams and mix
+        # s0 = s0 + h0, s1 = s1 + h1, s2 = s2 (identity)
+        x_updated = torch.stack([s0 + h0, s1 + h1, s2], dim=2)
+        return self.mixer(x_updated)
 
 class GPT(nn.Module):
     def __init__(self, h):
@@ -986,8 +985,8 @@ class GPT(nn.Module):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
         # Use streams from lanes
-        s0_l0 = lane0[:, :, 0]
-        s1_l1 = lane1[:, :, 1]
+        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0], lane0[:, :, 1], lane0[:, :, 2]
+        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0], lane1[:, :, 1], lane1[:, :, 2]
 
         attn_read = mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
@@ -1008,15 +1007,17 @@ class GPT(nn.Module):
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         
         # Mix into streams
-        lane0 = attn_resid * lane0
-        lane0[:, :, 0] = lane0[:, :, 0] + attn_post[0] * attn_out
-        lane0[:, :, 1] = lane0[:, :, 1] + mlp_post[0] * mlp_out
+        l0_s0 = attn_resid * s0_l0 + attn_post[0] * attn_out
+        l0_s1 = attn_resid * s1_l0 + mlp_post[0] * mlp_out
+        l0_s2 = attn_resid * s2_l0
+        lane0_updated = torch.stack([l0_s0, l0_s1, l0_s2], dim=2)
         
-        lane1 = mlp_resid * lane1
-        lane1[:, :, 0] = lane1[:, :, 0] + attn_post[1] * attn_out
-        lane1[:, :, 1] = lane1[:, :, 1] + mlp_post[1] * mlp_out
+        l1_s0 = mlp_resid * s0_l1 + attn_post[1] * attn_out
+        l1_s1 = mlp_resid * s1_l1 + mlp_post[1] * mlp_out
+        l1_s2 = mlp_resid * s2_l1
+        lane1_updated = torch.stack([l1_s0, l1_s1, l1_s2], dim=2)
         
-        return block.mixer(lane0), block.mixer(lane1)
+        return block.mixer(lane0_updated), block.mixer(lane1_updated)
 
     def _final_parallel_hidden(self, lane0, lane1):
         if self.parallel_final_lane == "mlp":
@@ -1204,7 +1205,7 @@ class GPT(nn.Module):
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
         mix = block.resid_mix.to(dtype=x.dtype)
-        s0, s1 = x[:, :, 0], x[:, :, 1]
+        s0, s1, s2 = x[:, :, 0], x[:, :, 1], x[:, :, 2]
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1244,10 +1245,9 @@ class GPT(nn.Module):
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
         h1 = block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         
-        delta = torch.zeros_like(x)
-        delta[:, :, 0] = h0
-        delta[:, :, 1] = h1
-        return block.mixer(x + delta)
+        # Updated streams stack
+        x_updated = torch.stack([s0 + h0, s1 + h1, s2], dim=2)
+        return block.mixer(x_updated)
 
     def _parallel_block_with_lora(
         self, block_idx, lane0, lane1, x0, lora, slot,
@@ -1255,8 +1255,8 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        s0_l0 = lane0[:, :, 0]
-        s1_l1 = lane1[:, :, 1]
+        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0], lane0[:, :, 1], lane0[:, :, 2]
+        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0], lane1[:, :, 1], lane1[:, :, 2]
         
         n = block.attn_norm(mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0) * block.ln_scale_factor
         attn = block.attn
@@ -1302,15 +1302,17 @@ class GPT(nn.Module):
         mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
         
         # Mix into streams
-        lane0 = attn_resid * lane0
-        lane0[:, :, 0] = lane0[:, :, 0] + attn_post[0] * attn_out
-        lane0[:, :, 1] = lane0[:, :, 1] + mlp_post[0] * mlp_out
+        l0_s0 = attn_resid * s0_l0 + attn_post[0] * attn_out
+        l0_s1 = attn_resid * s1_l0 + mlp_post[0] * mlp_out
+        l0_s2 = attn_resid * s2_l0
+        lane0_updated = torch.stack([l0_s0, l0_s1, l0_s2], dim=2)
         
-        lane1 = mlp_resid * lane1
-        lane1[:, :, 0] = lane1[:, :, 0] + attn_post[1] * attn_out
-        lane1[:, :, 1] = lane1[:, :, 1] + mlp_post[1] * mlp_out
+        l1_s0 = mlp_resid * s0_l1 + attn_post[1] * attn_out
+        l1_s1 = mlp_resid * s1_l1 + mlp_post[1] * mlp_out
+        l1_s2 = mlp_resid * s2_l1
+        lane1_updated = torch.stack([l1_s0, l1_s1, l1_s2], dim=2)
         
-        return block.mixer(lane0), block.mixer(lane1)
+        return block.mixer(lane0_updated), block.mixer(lane1_updated)
 
 
 class BatchedLinearLoRA(nn.Module):
