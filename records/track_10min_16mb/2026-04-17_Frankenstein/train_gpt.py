@@ -77,7 +77,7 @@ class Hyperparameters:
     # DeepSeek-v4: mHC & Engram
     num_mhc_streams = int(os.environ.get("NUM_MHC_STREAMS", 3))
     mhc_sinkhorn_iters = int(os.environ.get("MHC_SINKHORN_ITERS", 5))
-    engram_table_size = int(os.environ.get("ENGRAM_TABLE_SIZE", 524288))
+    engram_table_size = int(os.environ.get("ENGRAM_TABLE_SIZE", 131072))
     engram_dim = int(os.environ.get("ENGRAM_DIM", 4))
     engram_lr = float(os.environ.get("ENGRAM_LR", 0.01))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
@@ -241,7 +241,8 @@ class ManifoldMixer(nn.Module):
         for _ in range(self.iters):
             W = W / W.sum(dim=1, keepdim=True)
             W = W / W.sum(dim=0, keepdim=True)
-        return torch.einsum("btkd,kl->btld", x, W.to(x.dtype))
+        # Use matmul instead of einsum for better symbolic stride analysis in torch.compile
+        return (x.transpose(2, 3) @ W.to(x.dtype)).transpose(2, 3)
 
 
 def load_validation_tokens(pattern, seq_len):
@@ -806,7 +807,9 @@ class Block(nn.Module):
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
         # x is (B, T, K, D)
         mix = self.resid_mix.to(dtype=x.dtype)
-        s0, s1, s2 = x[:, :, 0], x[:, :, 1], x[:, :, 2]
+        # Use unbind instead of slicing for more robust symbolic shape analysis
+        streams = x.unbind(dim=2)
+        s0, s1, s2 = streams[0], streams[1], streams[2]
 
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         attn_out = self.attn(
@@ -821,7 +824,6 @@ class Block(nn.Module):
         h1 = self.mlp_scale.to(dtype=s1.dtype)[None, None, :] * h1
 
         # DeepSeek-v4: Update streams and mix
-        # s0 = s0 + h0, s1 = s1 + h1, s2 = s2 (identity)
         x_updated = torch.stack([s0 + h0, s1 + h1, s2], dim=2)
         return self.mixer(x_updated)
 
@@ -984,9 +986,11 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        # Use streams from lanes
-        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0], lane0[:, :, 1], lane0[:, :, 2]
-        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0], lane1[:, :, 1], lane1[:, :, 2]
+        # Use streams from lanes via unbind
+        streams0 = lane0.unbind(dim=2)
+        s0_l0, s1_l0, s2_l0 = streams0[0], streams0[1], streams0[2]
+        streams1 = lane1.unbind(dim=2)
+        s0_l1, s1_l1, s2_l1 = streams1[0], streams1[1], streams1[2]
 
         attn_read = mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
@@ -3038,6 +3042,7 @@ def main():
     enable_math_sdp(False)
     torch._dynamo.config.optimize_ddp = False
     torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.dynamic_shapes = True
     h = Hyperparameters()
     set_logging_hparams(h)
     if h.is_main_process:
