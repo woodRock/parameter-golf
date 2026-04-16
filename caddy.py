@@ -306,14 +306,17 @@ class CaddyApp(App):
             self.notify("Leaderboard is read-only.", severity="info")
 
     def launch_experiment(self, exp):
-        # Case-insensitive check for SP8192 or specific known models like "Bride"
+        # Case-insensitive check for SP8192 or specific known models like "Bride" or "DeepSeek"
         exp_name_upper = exp['name'].upper()
-        # Explicit check for "The_Bride" or "BRIDE" as these should always be 8192
-        is_sp8192 = "SP8192" in exp_name_upper or "8192" in exp_name_upper or "BRIDE" in exp_name_upper
+        # Explicit check for "The_Bride", "BRIDE", or "DEEPSEEK" as these should always be 8192
+        is_sota = any(k in exp_name_upper for k in ["SP8192", "8192", "BRIDE", "DEEPSEEK"])
         
-        variant = "sp8192" if is_sp8192 else "sp1024"
-        vocab_size = "8192" if is_sp8192 else "1024"
+        variant = "sp8192" if is_sota else "sp1024"
+        vocab_size = "8192" if is_sota else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
+        
+        # Determine number of GPUs to use (default to 8 for SOTA on RunPod)
+        nproc = "8" if is_sota else "1"
         
         # When running from the experiment dir, data/token paths need to be relative to it
         # or absolute. Using absolute paths from PROJECT_ROOT is safest.
@@ -330,21 +333,16 @@ class CaddyApp(App):
         # The script is in the current directory once we cd
         script_name = "train_gpt.py"
         if not (exp['path'] / script_name).exists():
-            # If no local script, we can't easily run it with this strategy 
-            # unless we copy it or point to root.
             script_path = (PROJECT_ROOT / script_name).resolve()
         else:
             script_path = script_name
 
         # Build the command exactly as it would be typed in a shell
-        # Environment variables are passed directly before the command, with no extra quotes
         env_str = (
             f"WANDB_ENABLED=1 TTT_ENABLED={ttt_flag} RUN_ID={exp['name']} "
             f"DATA_PATH={data_path} TOKENIZER_PATH={token_path} VOCAB_SIZE={vocab_size}"
         )
-        # We don't wrap the inner command in quotes because 'task' (or 'ts') 
-        # usually wants the command and its arguments as separate words.
-        run_cmd = f"task -G 1 -m 45 -n {exp['name']} {env_str} torchrun --standalone --nproc_per_node=1 {script_path}"
+        run_cmd = f"task -G {nproc} -m 45 -n {exp['name']} {env_str} torchrun --standalone --nproc_per_node={nproc} {script_path}"
         
         def run_it(interactive: bool = True):
             if interactive:
