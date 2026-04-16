@@ -315,8 +315,8 @@ class CaddyApp(App):
         vocab_size = "8192" if is_sota else "1024"
         model_file = f"fineweb_{vocab_size}_bpe.model"
         
-        # Determine number of GPUs to use (default to 8 for SOTA on RunPod)
-        nproc = "8" if is_sota else "1"
+        # Determine number of GPUs to use (forced to 1 for ECS server)
+        nproc = os.environ.get("NPROC", "1")
         
         # When running from the experiment dir, data/token paths need to be relative to it
         # or absolute. Using absolute paths from PROJECT_ROOT is safest.
