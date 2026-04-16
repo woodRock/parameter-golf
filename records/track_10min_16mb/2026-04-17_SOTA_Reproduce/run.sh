@@ -15,6 +15,7 @@ echo "=== Downloading SP8192 data ==="
 # python3 "$REPO_ROOT/data/cached_challenge_fineweb.py" --variant sp8192
 
 echo "=== Training (3 seeds) ==="
+cd "$REPO_ROOT"
 for SEED in 42 314 999; do
   echo "--- Seed $SEED ---"
   SEED=$SEED \
