@@ -3017,9 +3017,13 @@ def train_and_eval(h, device):
                     weight_decay=h.ttt_weight_decay,
                     fused=True,
                 )
-                for ctx_len in (h.ttt_chunk_size, h.ttt_eval_seq_len):
+                # Warm up from largest to smallest to force better symbolic generalization
+                for ctx_len in (h.ttt_eval_seq_len, h.ttt_chunk_size):
                     xw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
                     yw = torch.randint(0, h.vocab_size, (bsz, ctx_len), device=device, dtype=torch.int64)
+                    # Hint to compiler that ctx_len is dynamic
+                    torch._dynamo.mark_dynamic(xw, 1)
+                    torch._dynamo.mark_dynamic(yw, 1)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         ptl = fwd_ttt_compiled(xw, yw, lora=wl)
                     ptl[:, : min(h.ttt_chunk_size, ctx_len)].mean(dim=-1).sum().backward()
