@@ -1244,7 +1244,12 @@ class GPT(nn.Module):
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
         mix = block.resid_mix.to(dtype=x.dtype)
-        s0, s1, s2 = x[:, :, 0].contiguous(), x[:, :, 1].contiguous(), x[:, :, 2].contiguous()
+        bsz, seqlen, nstreams, dim = x.shape
+        # Reshape to (B*T, K, D) so stream strides are constant (K*D), not T-dependent
+        xf = x.reshape(bsz * seqlen, nstreams, dim)
+        s0 = xf[:, 0].contiguous().view(bsz, seqlen, dim)
+        s1 = xf[:, 1].contiguous().view(bsz, seqlen, dim)
+        s2 = xf[:, 2].contiguous().view(bsz, seqlen, dim)
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1294,9 +1299,17 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0].contiguous(), lane0[:, :, 1].contiguous(), lane0[:, :, 2].contiguous()
-        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0].contiguous(), lane1[:, :, 1].contiguous(), lane1[:, :, 2].contiguous()
-        
+        bsz, seqlen, nstreams, dim = lane0.shape
+        # Reshape to (B*T, K, D) so stream strides are constant (K*D), not T-dependent
+        l0f = lane0.reshape(bsz * seqlen, nstreams, dim)
+        s0_l0 = l0f[:, 0].contiguous().view(bsz, seqlen, dim)
+        s1_l0 = l0f[:, 1].contiguous().view(bsz, seqlen, dim)
+        s2_l0 = l0f[:, 2].contiguous().view(bsz, seqlen, dim)
+        l1f = lane1.reshape(bsz * seqlen, nstreams, dim)
+        s0_l1 = l1f[:, 0].contiguous().view(bsz, seqlen, dim)
+        s1_l1 = l1f[:, 1].contiguous().view(bsz, seqlen, dim)
+        s2_l1 = l1f[:, 2].contiguous().view(bsz, seqlen, dim)
+
         n = block.attn_norm(mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
