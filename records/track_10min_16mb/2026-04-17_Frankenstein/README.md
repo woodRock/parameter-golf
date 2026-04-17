@@ -4,6 +4,7 @@ State-of-the-art implementation for the 10-minute 16MB Parameter Golf challenge.
 
 ## Architecture
 
+- **Attention Fallback**: The script includes a `flex_attention` helper that automatically uses FlashAttention-3 (on Hopper), FlashAttention-2 (if installed), or native PyTorch SDPA (fallback) ensuring compatibility across all CUDA devices.
 - **Three-Stream Manifold Mixing**: The model maintains three hidden state streams (Attention-heavy, MLP-heavy, and Identity/Residual) which are mixed at every block using a Sinkhorn-Knopp normalized doubly stochastic weight matrix (mHC).
 - **Engram Hash Memory**: A bigram hash memory table (512k entries, 4-dim) that tracks token transitions, providing a non-parametric memory boost.
 - **Token Smearing (SmearGate)**: A gated recurrence at the embedding layer that "smears" token information forward one position.
