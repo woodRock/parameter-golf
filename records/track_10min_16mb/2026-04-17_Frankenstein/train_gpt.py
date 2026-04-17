@@ -1163,11 +1163,12 @@ class GPT(nn.Module):
         x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
         if self.embed_proj is not None:
             x_emb = self.embed_proj(x_emb)
-        
+
         x_mem = self.engram(input_ids)
-        # x is (B, T, K, D)
-        # s0: embedding, s1: engram, s2: identity/residual
-        x = torch.stack([x_emb, x_mem, torch.zeros_like(x_emb)], dim=2)
+        # Keep streams as separate (B, T, D) tensors throughout to avoid
+        # (B, T, K, D) stacking whose backward creates T-dependent strides.
+        # s0: embedding, s1: engram, s2: residual
+        s0, s1, s2 = x_emb, x_mem, torch.zeros_like(x_emb)
         x0 = x_emb
         skips = []
         enc_iter = (
@@ -1188,47 +1189,59 @@ class GPT(nn.Module):
         slot = 0
         for i in enc_iter:
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            s0, s1, s2 = self._block_with_lora(self.blocks[i], s0, s1, s2, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
-            skips.append(x)
+            skips.append((s0, s1, s2))
         psl = self.parallel_start_layer
-        lane0 = None
-        lane1 = None
+        l0_s0 = l0_s1 = l0_s2 = None
+        l1_s0 = l1_s1 = l1_s2 = None
         for skip_idx, i in enumerate(dec_iter):
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
-                if lane0 is None:
-                    lane0 = x
-                    lane1 = x
+                if l0_s0 is None:
+                    l0_s0, l0_s1, l0_s2 = s0, s1, s2
+                    l1_s0, l1_s1, l1_s2 = s0, s1, s2
                 if skip_idx < self.num_skip_weights and skips:
-                    skip = skips.pop()
-                    w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, None, :]
+                    sk0, sk1, sk2 = skips.pop()
+                    sw = self.skip_weights[skip_idx].to(dtype=l0_s0.dtype)
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, None, :]
-                        lane0 = torch.lerp(w * skip, lane0, g)
+                        sg = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=l0_s0.dtype))
+                        l0_s0 = torch.lerp(sw * sk0, l0_s0, sg)
+                        l0_s1 = torch.lerp(sw * sk1, l0_s1, sg)
+                        l0_s2 = torch.lerp(sw * sk2, l0_s2, sg)
                     else:
-                        lane0 = lane0 + w * skip
-                lane0, lane1 = self._parallel_block_with_lora(
-                    i, lane0, lane1, x0, lora, slot,
+                        l0_s0 = l0_s0 + sw * sk0
+                        l0_s1 = l0_s1 + sw * sk1
+                        l0_s2 = l0_s2 + sw * sk2
+                l0_s0, l0_s1, l0_s2, l1_s0, l1_s1, l1_s2 = self._parallel_block_with_lora(
+                    i, l0_s0, l0_s1, l0_s2, l1_s0, l1_s1, l1_s2, x0, lora, slot,
                     q_w, k_w, v_w, out_w, up_w, down_w,
                 )
             else:
                 if skip_idx < self.num_skip_weights and skips:
-                    scaled_skip = (
-                        self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, None, :]
-                        * skips.pop()
-                    )
+                    sk0, sk1, sk2 = skips.pop()
+                    sw = self.skip_weights[skip_idx].to(dtype=s0.dtype)
                     if self.skip_gates is not None:
-                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, None, :]
-                        x = torch.lerp(scaled_skip, x, g)
+                        sg = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=s0.dtype))
+                        s0 = torch.lerp(sw * sk0, s0, sg)
+                        s1 = torch.lerp(sw * sk1, s1, sg)
+                        s2 = torch.lerp(sw * sk2, s2, sg)
                     else:
-                        x = x + scaled_skip
-                x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                        s0 = s0 + sw * sk0
+                        s1 = s1 + sw * sk1
+                        s2 = s2 + sw * sk2
+                s0, s1, s2 = self._block_with_lora(self.blocks[i], s0, s1, s2, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
-        if lane0 is not None:
-            x = self._final_parallel_hidden(lane0, lane1)
-        # Extract stream 0
-        x = self.final_norm(x[:, :, 0])
+        if l0_s0 is not None:
+            if self.parallel_final_lane == "mlp":
+                s0, s1, s2 = l1_s0, l1_s1, l1_s2
+            elif self.parallel_final_lane == "attn":
+                s0, s1, s2 = l0_s0, l0_s1, l0_s2
+            else:
+                s0 = 0.5 * (l0_s0 + l1_s0)
+                s1 = 0.5 * (l0_s1 + l1_s1)
+                s2 = 0.5 * (l0_s2 + l1_s2)
+        x = self.final_norm(s0)
         if self.head_proj is not None:
             x = self.head_proj(x)
         if self.tie_embeddings:
@@ -1242,14 +1255,8 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
-        bsz, seqlen, nstreams, dim = x.shape
-        # Reshape to (B*T, K, D) so stream strides are constant (K*D), not T-dependent
-        xf = x.reshape(bsz * seqlen, nstreams, dim)
-        s0 = xf[:, 0].contiguous().view(bsz, seqlen, dim)
-        s1 = xf[:, 1].contiguous().view(bsz, seqlen, dim)
-        s2 = xf[:, 2].contiguous().view(bsz, seqlen, dim)
+    def _block_with_lora(self, block, s0, s1, s2, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
+        mix = block.resid_mix.to(dtype=s0.dtype)
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1281,34 +1288,25 @@ class GPT(nn.Module):
         attn_out = F.linear(y, out_w.to(n.dtype))
         if lora.o_loras is not None:
             attn_out = attn_out + lora.o_loras[slot](n)
-        h0 = block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        
+        h0 = block.attn_scale.to(dtype=s0.dtype)[None, None, :] * attn_out
+
         mlp_n = block.mlp_norm(s1) * block.ln_scale_factor
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        h1 = block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        
-        # Updated streams stack
+        h1 = block.mlp_scale.to(dtype=s0.dtype)[None, None, :] * mlp_out
+
         x_updated = torch.stack([s0 + h0, s1 + h1, s2], dim=2)
-        return block.mixer(x_updated)
+        mixed = block.mixer(x_updated)
+        out0, out1, out2 = mixed.unbind(dim=2)
+        return out0, out1, out2
 
     def _parallel_block_with_lora(
-        self, block_idx, lane0, lane1, x0, lora, slot,
+        self, block_idx, s0_l0, s1_l0, s2_l0, s0_l1, s1_l1, s2_l1, x0, lora, slot,
         q_w, k_w, v_w, out_w, up_w, down_w,
     ):
         block = self.blocks[block_idx]
-        mix = block.resid_mix.to(dtype=lane0.dtype)
-        bsz, seqlen, nstreams, dim = lane0.shape
-        # Reshape to (B*T, K, D) so stream strides are constant (K*D), not T-dependent
-        l0f = lane0.reshape(bsz * seqlen, nstreams, dim)
-        s0_l0 = l0f[:, 0].contiguous().view(bsz, seqlen, dim)
-        s1_l0 = l0f[:, 1].contiguous().view(bsz, seqlen, dim)
-        s2_l0 = l0f[:, 2].contiguous().view(bsz, seqlen, dim)
-        l1f = lane1.reshape(bsz * seqlen, nstreams, dim)
-        s0_l1 = l1f[:, 0].contiguous().view(bsz, seqlen, dim)
-        s1_l1 = l1f[:, 1].contiguous().view(bsz, seqlen, dim)
-        s2_l1 = l1f[:, 2].contiguous().view(bsz, seqlen, dim)
+        mix = block.resid_mix.to(dtype=s0_l0.dtype)
 
         n = block.attn_norm(mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0) * block.ln_scale_factor
         attn = block.attn
@@ -1346,25 +1344,28 @@ class GPT(nn.Module):
         mlp_out = block.mlp(mlp_n, up_w, down_w)
         if lora.mlp_loras is not None:
             mlp_out = mlp_out + lora.mlp_loras[slot](mlp_n)
-        mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
-        
-        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=lane0.dtype)
-        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=lane0.dtype)
-        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=lane0.dtype)
-        
-        # Mix into streams
-        l0_s0 = attn_resid * s0_l0 + attn_post[0] * attn_out
-        l0_s1 = attn_resid * s1_l0 + mlp_post[0] * mlp_out
-        l0_s2 = attn_resid * s2_l0
-        lane0_updated = torch.stack([l0_s0, l0_s1, l0_s2], dim=2)
-        
-        l1_s0 = mlp_resid * s0_l1 + attn_post[1] * attn_out
-        l1_s1 = mlp_resid * s1_l1 + mlp_post[1] * mlp_out
-        l1_s2 = mlp_resid * s2_l1
-        lane1_updated = torch.stack([l1_s0, l1_s1, l1_s2], dim=2)
-        
-        return block.mixer(lane0_updated), block.mixer(lane1_updated)
+        mlp_out = block.mlp_scale.to(dtype=s0_l0.dtype)[None, None, :] * mlp_out
+
+        attn_resid = self.parallel_resid_lambdas[block_idx, 0].to(dtype=s0_l0.dtype)
+        attn_post = self.parallel_post_lambdas[block_idx, 0].to(dtype=s0_l0.dtype)
+        mlp_resid = self.parallel_resid_lambdas[block_idx, 1].to(dtype=s0_l0.dtype)
+        mlp_post = self.parallel_post_lambdas[block_idx, 1].to(dtype=s0_l0.dtype)
+
+        l0_s0_out = attn_resid * s0_l0 + attn_post[0] * attn_out
+        l0_s1_out = attn_resid * s1_l0 + mlp_post[0] * mlp_out
+        l0_s2_out = attn_resid * s2_l0
+        lane0_updated = torch.stack([l0_s0_out, l0_s1_out, l0_s2_out], dim=2)
+
+        l1_s0_out = mlp_resid * s0_l1 + attn_post[1] * attn_out
+        l1_s1_out = mlp_resid * s1_l1 + mlp_post[1] * mlp_out
+        l1_s2_out = mlp_resid * s2_l1
+        lane1_updated = torch.stack([l1_s0_out, l1_s1_out, l1_s2_out], dim=2)
+
+        m0 = block.mixer(lane0_updated)
+        m1 = block.mixer(lane1_updated)
+        out0_l0, out1_l0, out2_l0 = m0.unbind(dim=2)
+        out0_l1, out1_l1, out2_l1 = m1.unbind(dim=2)
+        return out0_l0, out1_l0, out2_l0, out0_l1, out1_l1, out2_l1
 
 
 class BatchedLinearLoRA(nn.Module):
