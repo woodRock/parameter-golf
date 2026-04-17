@@ -1244,7 +1244,7 @@ class GPT(nn.Module):
 
     def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
         mix = block.resid_mix.to(dtype=x.dtype)
-        s0, s1, s2 = x[:, :, 0], x[:, :, 1], x[:, :, 2]
+        s0, s1, s2 = x[:, :, 0].contiguous(), x[:, :, 1].contiguous(), x[:, :, 2].contiguous()
         x_in = mix[0][None, None, :] * s0 + mix[1][None, None, :] * x0
         n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
@@ -1294,8 +1294,8 @@ class GPT(nn.Module):
     ):
         block = self.blocks[block_idx]
         mix = block.resid_mix.to(dtype=lane0.dtype)
-        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0], lane0[:, :, 1], lane0[:, :, 2]
-        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0], lane1[:, :, 1], lane1[:, :, 2]
+        s0_l0, s1_l0, s2_l0 = lane0[:, :, 0].contiguous(), lane0[:, :, 1].contiguous(), lane0[:, :, 2].contiguous()
+        s0_l1, s1_l1, s2_l1 = lane1[:, :, 0].contiguous(), lane1[:, :, 1].contiguous(), lane1[:, :, 2].contiguous()
         
         n = block.attn_norm(mix[0][None, None, :] * s0_l0 + mix[1][None, None, :] * x0) * block.ln_scale_factor
         attn = block.attn
