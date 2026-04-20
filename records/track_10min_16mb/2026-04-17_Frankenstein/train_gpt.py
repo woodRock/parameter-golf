@@ -2,7 +2,10 @@ import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
+_DISABLE_FA3 = bool(int(os.environ.get("DISABLE_FA3", "0")))
 try:
+    if _DISABLE_FA3:
+        raise ImportError("FA3 disabled via DISABLE_FA3=1")
     from flash_attn_interface import (
         flash_attn_func as flash_attn_3_func,
         flash_attn_varlen_func,
