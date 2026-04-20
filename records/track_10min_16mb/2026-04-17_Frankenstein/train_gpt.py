@@ -2,6 +2,8 @@ import base64, collections, copy, fcntl, glob, io, json, lzma, math, os
 from pathlib import Path
 import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as spm, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
+# Prevent CUDA OOM from memory fragmentation when packed seq shapes differ from normal batch shapes
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 _DISABLE_FA3 = bool(int(os.environ.get("DISABLE_FA3", "0")))
 try:
     if _DISABLE_FA3:
