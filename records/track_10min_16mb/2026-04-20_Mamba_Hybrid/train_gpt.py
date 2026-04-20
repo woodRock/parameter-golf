@@ -712,34 +712,19 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 # -----------------------------
-# HYBRID BLOCK
+# HYBRID BLOCKS
 # -----------------------------
+# Split into two concrete classes so torch.compile sees exactly 2 distinct types
+# when iterating over blocks, avoiding per-instance recompilation guards.
 
-class HybridBlock(nn.Module):
-    """
-    A single block that uses either MambaSSM or CausalSelfAttention,
-    always followed by an MLP. Interface is identical to the baseline Block.
-    """
-    def __init__(
-        self,
-        dim: int,
-        use_ssm: bool,
-        n_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        d_state: int,
-        chunk_size: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+class SSMBlock(nn.Module):
+    """Residual block: MambaSSM sublayer + relu² MLP."""
+    def __init__(self, dim: int, n_heads: int, mlp_mult: int, d_state: int, chunk_size: int):
         super().__init__()
         self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        if use_ssm:
-            self.attn = MambaSSM(dim, n_heads, d_state, chunk_size)
-        else:
-            self.attn = CausalSelfAttention(dim, n_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp_norm  = RMSNorm()
+        self.attn      = MambaSSM(dim, n_heads, d_state, chunk_size)
+        self.mlp       = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale  = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix  = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -747,8 +732,27 @@ class HybridBlock(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
+class AttnBlock(nn.Module):
+    """Residual block: CausalSelfAttention sublayer + relu² MLP."""
+    def __init__(self, dim: int, n_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm  = RMSNorm()
+        self.attn      = CausalSelfAttention(dim, n_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp       = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale  = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix  = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -804,17 +808,9 @@ class HybridGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
         self.blocks = nn.ModuleList([
-            HybridBlock(
-                dim=model_dim,
-                use_ssm=ssm_flags[i],
-                n_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                mlp_mult=mlp_mult,
-                d_state=ssm_d_state,
-                chunk_size=ssm_chunk_size,
-                rope_base=rope_base,
-                qk_gain_init=qk_gain_init,
-            )
+            SSMBlock(model_dim, num_heads, mlp_mult, ssm_d_state, ssm_chunk_size)
+            if ssm_flags[i] else
+            AttnBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -964,6 +960,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Raise the dynamo cache limit so the 2 block types (SSMBlock/AttnBlock) in
+    # the ModuleList loop each get a stable compiled trace without eviction.
+    torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
