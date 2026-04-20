@@ -155,11 +155,22 @@ class Hyperparameters:
 
 
 _logger_hparams = None
+_wandb_run = None
+
+try:
+    import wandb as _wandb_mod
+except ImportError:
+    _wandb_mod = None
 
 
 def set_logging_hparams(h):
     global _logger_hparams
     _logger_hparams = h
+
+
+def wandb_log(metrics: dict, step: int | None = None):
+    if _wandb_run is not None and (_logger_hparams is None or _logger_hparams.is_main_process):
+        _wandb_run.log(metrics, step=step)
 
 
 def log(msg, console=True):
@@ -2836,6 +2847,7 @@ def train_model(h, device, val_data):
             log(
                 f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}"
             )
+            wandb_log({"val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": training_time_ms}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -2872,6 +2884,7 @@ def train_model(h, device, val_data):
             log(
                 f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
+            wandb_log({"train_loss": train_loss.item(), "tok_per_sec": tok_per_sec, "lr_scale": scale}, step=step)
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         )
@@ -3059,6 +3072,9 @@ def train_and_eval(h, device):
             f"quantized_ttt_lora val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f} eval_time:{1e3*ttt_eval_elapsed:.0f}ms"
         )
         log(f"total_eval_time:{ttt_eval_elapsed:.1f}s")
+        wandb_log({"final_ttt_val_loss": ttt_val_loss, "final_ttt_val_bpb": ttt_val_bpb})
+        if _wandb_run is not None:
+            _wandb_run.finish()
         del ttt_model
 
 
@@ -3098,6 +3114,14 @@ def main():
     torch._dynamo.config.dynamic_shapes = True
     h = Hyperparameters()
     set_logging_hparams(h)
+    global _wandb_run
+    wandb_project = os.environ.get("WANDB_PROJECT", "")
+    if h.is_main_process and wandb_project and _wandb_mod is not None:
+        _wandb_run = _wandb_mod.init(
+            project=wandb_project,
+            name=h.run_id,
+            config={k: v for k, v in sorted(vars(type(h)).items()) if not k.startswith("_")},
+        )
     if h.is_main_process:
         os.makedirs(h.artifact_dir if h.artifact_dir else "logs", exist_ok=True)
         log(100 * "=", console=False)
