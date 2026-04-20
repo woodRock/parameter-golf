@@ -680,7 +680,7 @@ class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
         return dx.view_as(x), dw1, dw2
 
 
-FusedLeakyReLUSquareMLP = torch._dynamo.allow_in_graph(FusedLinearLeakyReLUSquareFunction.apply)
+FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
 
 
 class Rotary(nn.Module):
@@ -816,7 +816,7 @@ class MLP(nn.Module):
             self.mlp_gate_proj._zero_init = True
 
     def forward(self, x, up_w, down_w):
-        if self.training and self.use_fused and not self.gate_mlp_out:
+        if self.training and self.use_fused and not self.gate_mlp_out and not torch.compiler.is_compiling():
             return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
         hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
