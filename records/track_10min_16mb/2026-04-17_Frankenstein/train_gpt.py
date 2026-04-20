@@ -507,6 +507,27 @@ class ShuffledSequenceLoader:
         )
 
 
+@torch._dynamo.disable
+def _varlen_sdpa_fallback(q, k, v, cu_seqlens, causal):
+    """Per-document SDPA fallback when no flash_attn is available. Disabled from
+    torch.compile to avoid data-dependent shape guards on per-doc sequence lengths."""
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    out_parts = []
+    offset = 0
+    for slen in seqlens:
+        slen = int(slen)
+        qi = q[:, :, offset:offset + slen, :]
+        ki = k[:, :, offset:offset + slen, :]
+        vi = v[:, :, offset:offset + slen, :]
+        oi = F.scaled_dot_product_attention(
+            qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2),
+            is_causal=causal,
+        ).transpose(1, 2)
+        out_parts.append(oi)
+        offset += slen
+    return torch.cat(out_parts, dim=2)
+
+
 def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
     if HAS_FA3:
         if cu_seqlens is not None:
@@ -518,7 +539,7 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
             )[None]
         else:
             return flash_attn_3_func(q, k, v, causal=causal)
-    
+
     # Fallback to PyTorch native attention
     if cu_seqlens is not None:
         if HAS_FA2:
@@ -528,22 +549,7 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
                 max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=causal,
             )[None]
-        # No flash_attn: process each document separately to avoid huge packed seq
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        out_parts = []
-        offset = 0
-        for slen in seqlens:
-            slen = int(slen)
-            qi = q[:, :, offset:offset + slen, :]  # (1, H, slen, d)
-            ki = k[:, :, offset:offset + slen, :]
-            vi = v[:, :, offset:offset + slen, :]
-            oi = F.scaled_dot_product_attention(
-                qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2),
-                is_causal=causal,
-            ).transpose(1, 2)
-            out_parts.append(oi)
-            offset += slen
-        return torch.cat(out_parts, dim=2)
+        return _varlen_sdpa_fallback(q, k, v, cu_seqlens, causal)
 
     # Basic causal fallback
     return F.scaled_dot_product_attention(
