@@ -507,27 +507,6 @@ class ShuffledSequenceLoader:
         )
 
 
-@torch._dynamo.disable
-def _varlen_sdpa_fallback(q, k, v, cu_seqlens, causal):
-    """Per-document SDPA fallback when no flash_attn is available. Disabled from
-    torch.compile to avoid data-dependent shape guards on per-doc sequence lengths."""
-    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-    out_parts = []
-    offset = 0
-    for slen in seqlens:
-        slen = int(slen)
-        qi = q[:, :, offset:offset + slen, :]
-        ki = k[:, :, offset:offset + slen, :]
-        vi = v[:, :, offset:offset + slen, :]
-        oi = F.scaled_dot_product_attention(
-            qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2),
-            is_causal=causal,
-        ).transpose(1, 2)
-        out_parts.append(oi)
-        offset += slen
-    return torch.cat(out_parts, dim=2)
-
-
 def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
     if HAS_FA3:
         if cu_seqlens is not None:
@@ -549,7 +528,19 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
                 max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=causal,
             )[None]
-        return _varlen_sdpa_fallback(q, k, v, cu_seqlens, causal)
+        # Training packs uniform-length docs (all exactly max_seqlen tokens).
+        # Reshape to (n_docs, H, max_seqlen, d) so SDPA sees per-doc sequences —
+        # pure tensor ops, no Python loops, compatible with fullgraph=True compile.
+        H, T, d = q.shape[1], q.shape[2], q.shape[3]
+        n_docs = T // max_seqlen
+        q_d = q.view(n_docs, H, max_seqlen, d)
+        k_d = k.view(n_docs, H, max_seqlen, d)
+        v_d = v.view(n_docs, H, max_seqlen, d)
+        out = F.scaled_dot_product_attention(
+            q_d.transpose(1, 2), k_d.transpose(1, 2), v_d.transpose(1, 2),
+            is_causal=causal,
+        ).transpose(1, 2)
+        return out.view(1, H, T, d)
 
     # Basic causal fallback
     return F.scaled_dot_product_attention(
