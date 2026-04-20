@@ -680,7 +680,7 @@ class FusedLinearLeakyReLUSquareFunction(torch.autograd.Function):
         return dx.view_as(x), dw1, dw2
 
 
-FusedLeakyReLUSquareMLP = FusedLinearLeakyReLUSquareFunction.apply
+FusedLeakyReLUSquareMLP = torch._dynamo.allow_in_graph(FusedLinearLeakyReLUSquareFunction.apply)
 
 
 class Rotary(nn.Module):
