@@ -463,9 +463,17 @@ class ShuffledSequenceLoader:
         all_files = [Path(p) for p in sorted(glob.glob(h.train_files))]
         if not all_files:
             raise FileNotFoundError(f"No files found for pattern: {h.train_files}")
-        self.files = all_files[h.rank :: h.world_size]
+        all_rank_files = all_files[h.rank :: h.world_size]
         self.rng = np.random.Generator(np.random.PCG64(h.rank))
-        self.num_tokens = [_read_num_tokens(f) for f in self.files]
+        good_files, good_tokens = [], []
+        for f in all_rank_files:
+            try:
+                good_tokens.append(_read_num_tokens(f))
+                good_files.append(f)
+            except ValueError:
+                log(f"ShuffledSequenceLoader: skipping bad shard {f}")
+        self.files = good_files
+        self.num_tokens = good_tokens
         self.start_inds = [[] for _ in self.files]
         for si in range(len(self.files)):
             self._reset_shard(si)
