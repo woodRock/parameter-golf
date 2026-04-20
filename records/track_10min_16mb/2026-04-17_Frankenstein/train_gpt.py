@@ -544,10 +544,10 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
         ).transpose(1, 2)  # (n_docs, max_seqlen, Hq, d)
         return out.reshape(B, T, Hq, d)
 
-    # Basic causal fallback
+    # Basic causal fallback (enable_gqa handles num_heads != num_kv_heads)
     return F.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        is_causal=causal
+        is_causal=causal, enable_gqa=True,
     ).transpose(1, 2)
 
 
