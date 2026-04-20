@@ -2748,6 +2748,13 @@ def train_model(h, device, val_data):
             x, y, cu_seqlens, _max_seqlen = train_loader.next_batch(
                 h.train_batch_tokens, h.grad_accum_steps
             )
+            # Without flash_attn the packed (1, T) format causes OOM in inductor.
+            # Reshape to standard (B, seq_len) batched format instead.
+            if not HAS_FA2 and not HAS_FA3 and cu_seqlens is not None and x.shape[0] == 1:
+                n_seqs = x.shape[1] // h.train_seq_len
+                x = x.reshape(n_seqs, h.train_seq_len)
+                y = y.reshape(n_seqs, h.train_seq_len)
+                cu_seqlens = None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=h.train_seq_len)
             train_loss += loss.detach()
