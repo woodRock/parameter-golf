@@ -528,19 +528,19 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
                 max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=causal,
             )[None]
-        # q layout is (B, T, H, d) — training packs uniform-length docs (all
-        # exactly max_seqlen tokens). Reshape to (n_docs, max_seqlen, H, d) so
-        # SDPA sees per-doc sequences. Pure tensor ops; works with fullgraph=True.
-        B, T, H, d = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
+        # q layout is (B, T, Hq, d); k/v are (B, T, Hkv, d) with Hkv <= Hq (GQA).
+        # Reshape to (n_docs, max_seqlen, H, d) per-tensor and batch over docs.
+        B, T, Hq, d = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
+        Hkv = k.shape[2]
         n_docs = T // max_seqlen
-        q_d = q.reshape(n_docs, max_seqlen, H, d)
-        k_d = k.reshape(n_docs, max_seqlen, H, d)
-        v_d = v.reshape(n_docs, max_seqlen, H, d)
+        q_d = q.reshape(n_docs, max_seqlen, Hq, d)
+        k_d = k.reshape(n_docs, max_seqlen, Hkv, d)
+        v_d = v.reshape(n_docs, max_seqlen, Hkv, d)
         out = F.scaled_dot_product_attention(
             q_d.transpose(1, 2), k_d.transpose(1, 2), v_d.transpose(1, 2),
-            is_causal=causal,
-        ).transpose(1, 2)  # (n_docs, max_seqlen, H, d)
-        return out.reshape(B, T, H, d)
+            is_causal=causal, enable_gqa=True,
+        ).transpose(1, 2)  # (n_docs, max_seqlen, Hq, d)
+        return out.reshape(B, T, Hq, d)
 
     # Basic causal fallback
     return F.scaled_dot_product_attention(
