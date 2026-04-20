@@ -15,6 +15,17 @@ except ImportError:
     HAS_FA3 = False
     flash_attn_3_func = None
     flash_attn_varlen_func = None
+
+# Hoist flash_attn v2 import here so torch.compile never sees a dynamic import
+# inside a compiled graph (which causes Dynamo's "Import failure" error).
+try:
+    import flash_attn as _flash_attn_v2
+    _flash_attn_varlen_func = _flash_attn_v2.flash_attn_interface.flash_attn_varlen_func
+    HAS_FA2 = True
+except (ImportError, AttributeError):
+    _flash_attn_v2 = None
+    _flash_attn_varlen_func = None
+    HAS_FA2 = False
 from concurrent.futures import ThreadPoolExecutor
 import triton
 import triton.language as tl
@@ -519,17 +530,13 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
         # For simplicity in this SOTA script, we'll try to use a standard causal mask
         # but this might leak across document boundaries if not careful.
         # On non-Hopper, users should ideally install flash-attn (v2).
-        try:
-            import flash_attn
-            if cu_seqlens is not None:
-                return flash_attn.flash_attn_interface.flash_attn_varlen_func(
-                    q[0], k[0], v[0],
-                    cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-                    causal=causal,
-                )[None]
-        except ImportError:
-            pass
+        if HAS_FA2 and cu_seqlens is not None:
+            return _flash_attn_varlen_func(
+                q[0], k[0], v[0],
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=causal,
+            )[None]
 
     # Basic causal fallback
     return F.scaled_dot_product_attention(
