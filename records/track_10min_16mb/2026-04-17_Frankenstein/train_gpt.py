@@ -521,22 +521,29 @@ def flex_attention(q, k, v, cu_seqlens=None, max_seqlen=0, causal=True):
     
     # Fallback to PyTorch native attention
     if cu_seqlens is not None:
-        # For varlen, we'd ideally use a block mask or padding.
-        # For this challenge script, a simpler approach is to treat it as a single sequence
-        # and rely on the fact that document boundaries are handled by cu_seqlens in training.
-        # Without FA, we can't efficiently do packed attention without a custom mask.
-        # However, F.scaled_dot_product_attention is fast.
-        # We can reconstruct the mask from cu_seqlens if needed.
-        # For simplicity in this SOTA script, we'll try to use a standard causal mask
-        # but this might leak across document boundaries if not careful.
-        # On non-Hopper, users should ideally install flash-attn (v2).
-        if HAS_FA2 and cu_seqlens is not None:
+        if HAS_FA2:
             return _flash_attn_varlen_func(
                 q[0], k[0], v[0],
                 cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=causal,
             )[None]
+        # No flash_attn: process each document separately to avoid huge packed seq
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        out_parts = []
+        offset = 0
+        for slen in seqlens:
+            slen = int(slen)
+            qi = q[:, :, offset:offset + slen, :]  # (1, H, slen, d)
+            ki = k[:, :, offset:offset + slen, :]
+            vi = v[:, :, offset:offset + slen, :]
+            oi = F.scaled_dot_product_attention(
+                qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2),
+                is_causal=causal,
+            ).transpose(1, 2)
+            out_parts.append(oi)
+            offset += slen
+        return torch.cat(out_parts, dim=2)
 
     # Basic causal fallback
     return F.scaled_dot_product_attention(
