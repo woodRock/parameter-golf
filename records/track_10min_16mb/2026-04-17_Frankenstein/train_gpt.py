@@ -2791,6 +2791,12 @@ def train_model(h, device, val_data):
         )
         log(f"warmup_cu_buckets:{','.join(str(b) for b in warmup_cu_buckets)} iters_each:{warmup_cu_iters}")
         def _run_cu_bucket_warmup():
+            # Skip varlen warmup when no flash_attn: we fall back to standard SDPA
+            # (reshape-based), which doesn't need a separate compiled bucket warmup
+            # and the packed sequences cause OOM due to large inductor intermediate bufs.
+            if not HAS_FA2 and not HAS_FA3:
+                log("no flash_attn — skipping cu_seqlens bucket warmup")
+                return
             for bucket_len in warmup_cu_buckets:
                 boundaries = list(range(0, x.size(1), max(h.train_seq_len, 1)))
                 if boundaries[-1] != x.size(1):
