@@ -718,7 +718,7 @@ class GPT(nn.Module):
                 raise ValueError("num_loop_prelude + loop_block_size must be <= num_layers")
             self.num_encoder_layers = 0
             self.num_decoder_layers = 0
-            self.skip_weights = nn.Parameter(torch.zeros(0, model_dim, dtype=torch.float32))
+            self.skip_weights = None  # not used in loop mode; avoid DDP unused-parameter error
         else:
             self.num_encoder_layers = num_layers // 2
             self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -958,7 +958,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
+    if base_model.skip_weights is not None:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
