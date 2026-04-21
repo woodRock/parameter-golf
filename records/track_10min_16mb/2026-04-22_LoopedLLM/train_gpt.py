@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -69,6 +74,15 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    leaky_relu_neg_slope = float(os.environ.get("LEAKY_RELU_NEG_SLOPE", 0.0))  # 0 = relu^2, 0.5 = winner
+    partial_rope_dims = int(os.environ.get("PARTIAL_ROPE_DIMS", 0))  # 0 = full RoPE, 16 = winner
+    parallel_residual_from = int(os.environ.get("PARALLEL_RESIDUAL_FROM", -1))  # -1 = disabled, e.g. 7
+
+    # Looped LM hyperparameters (arxiv 2604.11791).
+    # loop_block_size > 0 enables looping: (num_loop_prelude, loop_block_size × num_loop_iters, coda) virtual depth.
+    loop_block_size = int(os.environ.get("LOOP_BLOCK_SIZE", 0))  # k: physical layers in the recurrent block
+    num_loop_iters = int(os.environ.get("NUM_LOOP_ITERS", 4))    # l: how many times to repeat the block
+    num_loop_prelude = int(os.environ.get("NUM_LOOP_PRELUDE", 2)) # p: layers before the loop
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -561,6 +575,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        partial_rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,6 +587,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.partial_rope_dims = partial_rope_dims if 0 < partial_rope_dims < self.head_dim else 0
+        rope_dim = self.partial_rope_dims if self.partial_rope_dims > 0 else self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -579,7 +596,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -589,8 +606,13 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.partial_rope_dims > 0:
+            r = self.partial_rope_dims
+            q = torch.cat([apply_rotary_emb(q[..., :r], cos, sin), q[..., r:]], dim=-1)
+            k = torch.cat([apply_rotary_emb(k[..., :r], cos, sin), k[..., r:]], dim=-1)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -605,16 +627,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    # leaky_relu^2 MLP (leaky_slope=0 reproduces the original relu^2)
+    def __init__(self, dim: int, mlp_mult: int, leaky_slope: float = 0.0):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.leaky_slope = leaky_slope
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=self.leaky_slope)
         return self.proj(x.square())
 
 
@@ -627,12 +650,16 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        leaky_slope: float = 0.0,
+        partial_rope_dims: int = 0,
+        parallel_residual: bool = False,
     ):
         super().__init__()
+        self.parallel_residual = parallel_residual
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, partial_rope_dims)
+        self.mlp = MLP(dim, mlp_mult, leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -640,9 +667,14 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.parallel_residual:
+            # GPT-J style: attention and MLP both read from the same pre-residual state
+            x_pre = x
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x_pre))
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_pre))
+        else:
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -660,6 +692,12 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        leaky_relu_neg_slope: float = 0.0,
+        partial_rope_dims: int = 0,
+        parallel_residual_from: int = -1,
+        loop_block_size: int = 0,
+        num_loop_iters: int = 4,
+        num_loop_prelude: int = 2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -668,10 +706,25 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+
+        # Looped LM mode (arxiv 2604.11791): (p, k×l, c) virtual depth from (p+k+c) physical blocks.
+        # Standard U-Net mode when loop_block_size == 0.
+        self.loop_block_size = loop_block_size
+        self.num_loop_iters = num_loop_iters
+        self.num_loop_prelude = num_loop_prelude if loop_block_size > 0 else 0
+
+        if loop_block_size > 0:
+            if num_loop_prelude + loop_block_size > num_layers:
+                raise ValueError("num_loop_prelude + loop_block_size must be <= num_layers")
+            self.num_encoder_layers = 0
+            self.num_decoder_layers = 0
+            self.skip_weights = nn.Parameter(torch.zeros(0, model_dim, dtype=torch.float32))
+        else:
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            n_skip = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = nn.Parameter(torch.ones(n_skip, model_dim, dtype=torch.float32))
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -681,6 +734,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    leaky_slope=leaky_relu_neg_slope,
+                    partial_rope_dims=partial_rope_dims,
+                    parallel_residual=(parallel_residual_from >= 0 and i >= parallel_residual_from),
                 )
                 for i in range(num_layers)
             ]
@@ -702,16 +758,29 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.loop_block_size > 0:
+            # Looped LM forward: prelude → (loop block × num_loop_iters) → coda.
+            # Each Block already injects x0 via its learned resid_mix, providing input injection
+            # at every recurrence step as the paper recommends (arxiv 2604.11791 §3).
+            loop_end = self.num_loop_prelude + self.loop_block_size
+            for i in range(self.num_loop_prelude):
+                x = self.blocks[i](x, x0)
+            for _ in range(self.num_loop_iters):
+                for i in range(self.num_loop_prelude, loop_end):
+                    x = self.blocks[i](x, x0)
+            for i in range(loop_end, len(self.blocks)):
+                x = self.blocks[i](x, x0)
+        else:
+            # U-Net forward: first half stores skip connections, second half reuses in reverse.
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -770,10 +839,33 @@ def main() -> None:
     enable_math_sdp(False)
 
     logfile = None
+    wandb_run = None
+    wandb_project = os.environ.get("WANDB_PROJECT", "")
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+        if wandb_project and _wandb is not None:
+            wandb_run = _wandb.init(
+                project=wandb_project,
+                name=args.run_id,
+                config={
+                    "num_layers": args.num_layers, "model_dim": args.model_dim,
+                    "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
+                    "mlp_mult": args.mlp_mult, "vocab_size": args.vocab_size,
+                    "train_seq_len": args.train_seq_len, "train_batch_tokens": args.train_batch_tokens,
+                    "iterations": args.iterations, "matrix_lr": args.matrix_lr,
+                    "scalar_lr": args.scalar_lr, "muon_momentum": args.muon_momentum,
+                    "max_wallclock_seconds": args.max_wallclock_seconds,
+                    "leaky_relu_neg_slope": args.leaky_relu_neg_slope,
+                    "partial_rope_dims": args.partial_rope_dims,
+                    "parallel_residual_from": args.parallel_residual_from,
+                    "loop_block_size": args.loop_block_size,
+                    "num_loop_iters": args.num_loop_iters,
+                    "num_loop_prelude": args.num_loop_prelude,
+                    "seed": args.seed,
+                },
+            )
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -836,6 +928,12 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        leaky_relu_neg_slope=args.leaky_relu_neg_slope,
+        partial_rope_dims=args.partial_rope_dims,
+        parallel_residual_from=args.parallel_residual_from,
+        loop_block_size=args.loop_block_size,
+        num_loop_iters=args.num_loop_iters,
+        num_loop_prelude=args.num_loop_prelude,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -898,6 +996,17 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if args.loop_block_size > 0:
+        loop_end = args.num_loop_prelude + args.loop_block_size
+        n_coda = args.num_layers - loop_end
+        virtual_depth = args.num_loop_prelude + args.loop_block_size * args.num_loop_iters + n_coda
+        log0(f"looped_lm:prelude={args.num_loop_prelude} block={args.loop_block_size} iters={args.num_loop_iters} coda={n_coda} virtual_depth={virtual_depth}")
+    if args.leaky_relu_neg_slope > 0:
+        log0(f"leaky_relu_neg_slope:{args.leaky_relu_neg_slope}")
+    if args.partial_rope_dims > 0:
+        log0(f"partial_rope_dims:{args.partial_rope_dims}")
+    if args.parallel_residual_from >= 0:
+        log0(f"parallel_residual_from_layer:{args.parallel_residual_from}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -994,6 +1103,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log({"val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": training_time_ms}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1045,6 +1156,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log({"train_loss": train_loss.item(), "lr_scale": scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1118,6 +1231,9 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb_run.log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
+        wandb_run.finish()
 
     if distributed:
         dist.destroy_process_group()
