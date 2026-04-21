@@ -3109,7 +3109,7 @@ def train_and_eval(h, device):
             f"quantized_ttt_lora val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f} eval_time:{1e3*ttt_eval_elapsed:.0f}ms"
         )
         log(f"total_eval_time:{ttt_eval_elapsed:.1f}s")
-        wandb_log({"final_ttt_val_loss": ttt_val_loss, "final_ttt_val_bpb": ttt_val_bpb})
+        wandb_log({"final_val_loss": ttt_val_loss, "final_val_bpb": ttt_val_bpb})
         if _wandb_run is not None:
             _wandb_run.finish()
         del ttt_model

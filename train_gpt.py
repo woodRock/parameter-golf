@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -834,10 +839,33 @@ def main() -> None:
     enable_math_sdp(False)
 
     logfile = None
+    wandb_run = None
+    wandb_project = os.environ.get("WANDB_PROJECT", "")
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+        if wandb_project and _wandb is not None:
+            wandb_run = _wandb.init(
+                project=wandb_project,
+                name=args.run_id,
+                config={
+                    "num_layers": args.num_layers, "model_dim": args.model_dim,
+                    "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
+                    "mlp_mult": args.mlp_mult, "vocab_size": args.vocab_size,
+                    "train_seq_len": args.train_seq_len, "train_batch_tokens": args.train_batch_tokens,
+                    "iterations": args.iterations, "matrix_lr": args.matrix_lr,
+                    "scalar_lr": args.scalar_lr, "muon_momentum": args.muon_momentum,
+                    "max_wallclock_seconds": args.max_wallclock_seconds,
+                    "leaky_relu_neg_slope": args.leaky_relu_neg_slope,
+                    "partial_rope_dims": args.partial_rope_dims,
+                    "parallel_residual_from": args.parallel_residual_from,
+                    "loop_block_size": args.loop_block_size,
+                    "num_loop_iters": args.num_loop_iters,
+                    "num_loop_prelude": args.num_loop_prelude,
+                    "seed": args.seed,
+                },
+            )
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -1075,6 +1103,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log({"val_loss": val_loss, "val_bpb": val_bpb, "train_time_ms": training_time_ms}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1126,6 +1156,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log({"train_loss": train_loss.item(), "lr_scale": scale}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1199,6 +1231,9 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb_run.log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
+        wandb_run.finish()
 
     if distributed:
         dist.destroy_process_group()

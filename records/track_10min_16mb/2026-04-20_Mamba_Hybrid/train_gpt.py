@@ -1233,7 +1233,7 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if wandb_run is not None:
-        wandb_run.log({"final_val_loss_int8": q_val_loss, "final_val_bpb_int8": q_val_bpb})
+        wandb_run.log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb})
         wandb_run.finish()
 
     if distributed:
