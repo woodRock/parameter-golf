@@ -200,11 +200,12 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         self.num_heads, self.num_kv_heads = h.num_heads, h.num_kv_heads
         self.head_dim = dim // h.num_heads
+        self.rope_dims = h.rope_dims
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_kv = CastedLinear(dim, 2 * h.num_kv_heads * self.head_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False); self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((h.num_heads,), h.qk_gain_init))
-        self.rotary = Rotary(self.head_dim, base=h.rope_base, train_seq_len=h.train_seq_len)
+        self.rotary = Rotary(self.head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
         self.diff_attn = diff_attn
         if diff_attn: self.lambda_diff = nn.Parameter(torch.zeros(h.num_heads // 2))
         self.gate_attn_out = h.gate_attn_out
@@ -220,7 +221,7 @@ class CausalSelfAttention(nn.Module):
         k, v = kv[:, :, 0], kv[:, :, 1]
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(T, x.device, q.dtype)
-        q, k = apply_rotary_emb(q, cos, sin, Hyperparameters.rope_dims), apply_rotary_emb(k, cos, sin, Hyperparameters.rope_dims)
+        q, k = apply_rotary_emb(q, cos, sin, self.rope_dims), apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(q.dtype)[None, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.diff_attn:
