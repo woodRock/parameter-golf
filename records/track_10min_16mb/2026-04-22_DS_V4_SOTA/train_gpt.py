@@ -44,7 +44,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 4800.0))
     val_batch_tokens = int(os.environ.get("VAL_BATCH_TOKENS", 524288))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
@@ -102,6 +102,9 @@ class Hyperparameters:
     engram_table_size = int(os.environ.get("ENGRAM_TABLE_SIZE", 131072))
     engram_dim = int(os.environ.get("ENGRAM_DIM", 4))
     engram_lr = float(os.environ.get("ENGRAM_LR", 0.01))
+    engram_inject_layers = [
+        int(x) for x in os.environ.get("ENGRAM_INJECT_LAYERS", "2,6").split(",") if x.strip()
+    ]
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 96))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0001))
@@ -908,6 +911,7 @@ class GPT(nn.Module):
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
         self.engram = EngramMemory(h.engram_table_size, h.engram_dim, h.model_dim)
+        self.engram_inject_layers = set(h.engram_inject_layers)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
             self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
@@ -1112,10 +1116,10 @@ class GPT(nn.Module):
         if self.embed_proj is not None:
             x_emb = self.embed_proj(x_emb)
         
-        x_mem = self.engram(input_ids)
-        # x is (B, T, K, D)
-        # s0: embedding, s1: engram, s2: identity/residual
-        x = torch.stack([x_emb, x_mem, torch.zeros_like(x_emb)], dim=2)
+        # s0: embedding, s1: engram (injected at specific layers), s2: identity/residual
+        x_mem_cached = self.engram(input_ids)
+        s1_init = torch.zeros_like(x_emb)
+        x = torch.stack([x_emb, s1_init, torch.zeros_like(x_emb)], dim=2)
         x0 = x_emb
         skips = []
         enc_iter = (
@@ -1132,6 +1136,9 @@ class GPT(nn.Module):
             )
         )
         for i in enc_iter:
+            if i in self.engram_inject_layers:
+                x = x.clone()
+                x[:, :, 1, :] = x[:, :, 1, :] + x_mem_cached
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             skips.append(x)
@@ -1139,6 +1146,12 @@ class GPT(nn.Module):
         lane0 = None
         lane1 = None
         for skip_idx, i in enumerate(dec_iter):
+            if i in self.engram_inject_layers:
+                if lane0 is not None:
+                    lane0 = lane0.clone(); lane0[:, :, 1, :] = lane0[:, :, 1, :] + x_mem_cached
+                    lane1 = lane1.clone(); lane1[:, :, 1, :] = lane1[:, :, 1, :] + x_mem_cached
+                else:
+                    x = x.clone(); x[:, :, 1, :] = x[:, :, 1, :] + x_mem_cached
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if lane0 is None:
@@ -1200,11 +1213,10 @@ class GPT(nn.Module):
         if self.embed_proj is not None:
             x_emb = self.embed_proj(x_emb)
 
-        x_mem = self.engram(input_ids)
         # Keep streams as separate (B, T, D) tensors throughout to avoid
         # (B, T, K, D) stacking whose backward creates T-dependent strides.
-        # s0: embedding, s1: engram, s2: residual
-        s0, s1, s2 = x_emb, x_mem, torch.zeros_like(x_emb)
+        # s0: embedding, s1: engram (injected at specific layers), s2: residual
+        s0, s1, s2 = x_emb, torch.zeros_like(x_emb), torch.zeros_like(x_emb)
         x0 = x_emb
         skips = []
         enc_iter = (
@@ -1223,7 +1235,10 @@ class GPT(nn.Module):
             )
         )
         slot = 0
+        x_mem_cached = self.engram(input_ids)
         for i in enc_iter:
+            if i in self.engram_inject_layers:
+                s1 = s1 + x_mem_cached
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             s0, s1, s2 = self._block_with_lora(self.blocks[i], s0, s1, s2, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
             slot += 1
@@ -1232,6 +1247,8 @@ class GPT(nn.Module):
         l0_s0 = l0_s1 = l0_s2 = None
         l1_s0 = l1_s1 = l1_s2 = None
         for skip_idx, i in enumerate(dec_iter):
+            if i in self.engram_inject_layers:
+                s1 = s1 + x_mem_cached
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
                 if l0_s0 is None:
