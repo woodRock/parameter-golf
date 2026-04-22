@@ -123,6 +123,7 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 13.0))
     matrix_bits = int(os.environ.get("MATRIX_BITS", 6))
+    mlp_bits = int(os.environ.get("MLP_BITS", 5))
     embed_bits = int(os.environ.get("EMBED_BITS", 7))
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 12.85))
     embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 15.0))
@@ -1975,7 +1976,12 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.attn_clip_sigmas
         else:
             cs = h.matrix_clip_sigmas
-        bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
+        if "tok_emb" in name:
+            bits = h.embed_bits
+        elif ".mlp." in name:
+            bits = h.mlp_bits
+        else:
+            bits = h.matrix_bits
         q, s = gptq_quantize_weight(
             t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1
         )

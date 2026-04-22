@@ -13,7 +13,7 @@ Frankenstein (`2026-04-17`) already implements all of the winner's architectural
 | Parallel residuals from layer 7 | ✓ | 8 (off-by-one) | **7** ✓ |
 | QK-Gain 5.25 | ✓ | 5.0 (default) | **5.25** ✓ |
 | Legal TTT | ✓ | LoRA-TTT | LoRA-TTT |
-| GPTQ int6 + SDClip | ✓ | ✓ | ✓ |
+| GPTQ int6 attn + **int5 MLP** + SDClip | int6 all | int6 all | **int5 MLP / int6 attn** ✓ |
 | mHC multi-stream mixing | ✗ | ✓ | ✓ |
 | Engram Hash Memory | ✗ | ✓ | ✓ |
 | SmearGate | ✗ | ✓ | ✓ |
@@ -31,7 +31,7 @@ The previous Frankenstein runs used mismatched hyperparameters vs the winner's p
 ## Run Command
 
 ```bash
-SEED=42 VOCAB_SIZE=8192 DATA_DIR=./data/ QK_GAIN_INIT=5.25 MATRIX_LR=0.022 WARMDOWN_FRAC=0.72 PARALLEL_START_LAYER=7 NUM_LOOPS=2 LOOP_START=3 LOOP_END=5 ENABLE_LOOPING_AT=0.35 SMEAR_GATE=1 SMEAR_GATE_WIDTH=12 GATE_ATTN_OUT=1 GATE_ATTN_SRC=proj GATE_WIDTH=12 NUM_MHC_STREAMS=3 MHC_SINKHORN_ITERS=5 ENGRAM_TABLE_SIZE=524288 ENGRAM_DIM=4 ENGRAM_LR=0.01 TTT_ENABLED=1 WANDB_PROJECT=parameter-golf torchrun --standalone --nproc_per_node=8 records/track_10min_16mb/2026-04-22_DS_V4_SOTA/train_gpt.py
+SEED=42 VOCAB_SIZE=8192 DATA_DIR=./data/ QK_GAIN_INIT=5.25 MATRIX_LR=0.022 WARMDOWN_FRAC=0.72 PARALLEL_START_LAYER=7 NUM_LOOPS=2 LOOP_START=3 LOOP_END=5 ENABLE_LOOPING_AT=0.35 SMEAR_GATE=1 SMEAR_GATE_WIDTH=12 GATE_ATTN_OUT=1 GATE_ATTN_SRC=proj GATE_WIDTH=12 NUM_MHC_STREAMS=3 MHC_SINKHORN_ITERS=5 ENGRAM_TABLE_SIZE=524288 ENGRAM_DIM=4 ENGRAM_LR=0.01 TTT_ENABLED=1 MLP_BITS=5 WANDB_PROJECT=parameter-golf torchrun --standalone --nproc_per_node=8 records/track_10min_16mb/2026-04-22_DS_V4_SOTA/train_gpt.py
 ```
 
 ## Key Differences from Previous Frankenstein Run
