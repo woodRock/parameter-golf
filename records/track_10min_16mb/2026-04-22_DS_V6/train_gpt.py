@@ -11,11 +11,11 @@ Building on the 1.07 BPB Frankenstein SOTA, this DS_V6 version integrates:
 6. Full Hyperparameter Support: Respects all environment variables from the user.
 
 Fixes:
+- Added missing 'random' and 'json' imports.
 - Removed dependency on root train_gpt (fixed InferenceMode error).
-- Fixed scale calculation (using warmdown_frac instead of warmup_steps).
-- Self-contained implementation of loaders and metrics.
+- Fixed scale calculation (using warmdown_frac).
 """
-import collections, copy, glob, io, lzma, math, os, re, subprocess, sys, time, uuid
+import base64, collections, copy, fcntl, glob, io, json, lzma, math, os, random, re, subprocess, sys, time, uuid
 from pathlib import Path
 import numpy as np
 import sentencepiece as spm
@@ -237,7 +237,9 @@ class MLP(nn.Module):
     def __init__(self, dim, h):
         super().__init__()
         hidden = int(dim * h.mlp_mult)
-        self.fc_gate, self.fc_up, self.proj = CastedLinear(dim, hidden, bias=False), CastedLinear(dim, hidden, bias=False), CastedLinear(hidden, dim, bias=False)
+        self.fc_gate = CastedLinear(dim, hidden, bias=False)
+        self.fc_up   = CastedLinear(dim, hidden, bias=False)
+        self.proj    = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
         self.gate_mlp_out, self.gate_width = h.gate_mlp_out, h.gate_width
         if h.gate_mlp_out:
