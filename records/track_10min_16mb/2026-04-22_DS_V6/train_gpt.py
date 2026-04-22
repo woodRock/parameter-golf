@@ -435,15 +435,15 @@ def gptq_quantize(w, H, bits, sigmas):
     H.diagonal().add_(0.01 * H.diag().mean())
     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
     Hinv = torch.linalg.cholesky(Hinv, upper=True)
-    scale = (sigmas * W.std(dim=1) / (2**(bits-1)-1)).clamp_min(1e-10).unsqueeze(1)
+    scale = (sigmas * W.std(dim=1) / (2**(bits-1)-1)).clamp_min(1e-10).view(-1, 1)
     Q = torch.zeros_like(W, dtype=torch.int8)
     for i in range(W.shape[1]):
         w_col = W[:, i]; d = Hinv[i, i]
-        q_col = torch.clamp(torch.round(w_col / scale), -2**(bits-1)+1, 2**(bits-1)-1)
+        q_col = torch.clamp(torch.round(w_col / scale.view(-1)), -2**(bits-1)+1, 2**(bits-1)-1)
         Q[:, i] = q_col.to(torch.int8)
-        err = (w_col - q_col * scale.squeeze()) / d
+        err = (w_col - q_col * scale.view(-1)) / d
         W[:, i:] -= err.unsqueeze(1) * Hinv[i, i:].unsqueeze(0)
-    return Q, scale.squeeze().half()
+    return Q, scale.view(-1).half()
 
 def serialize(h, model, code):
     sd = {k: v.cpu() for k, v in model.state_dict().items()}
