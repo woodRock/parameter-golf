@@ -306,10 +306,10 @@ class GPT(nn.Module):
         hidden = self.forward_logits(tokens, return_hidden=True)
         logits = F.linear(hidden, self.tok_emb.weight) if self.h.tie_embeddings else self.lm_head(hidden)
         logits = self.h.logit_softcap * torch.tanh(logits / self.h.logit_softcap)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)).float(), targets.view(-1), reduction='mean')
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), targets.reshape(-1), reduction='mean')
         if self.mtp_proj and mtp_targets is not None:
             mtp_h = self.mtp_proj(hidden); mtp_logits = F.linear(mtp_h, self.tok_emb.weight)
-            mtp_loss = F.cross_entropy(mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)).float(), mtp_targets.view(-1), reduction='mean')
+            mtp_loss = F.cross_entropy(mtp_logits[:, :-1].reshape(-1, mtp_logits.size(-1)).float(), mtp_targets.reshape(-1), reduction='mean')
             loss = loss + self.h.mtp_lambda * mtp_loss
         return loss
 
@@ -348,7 +348,7 @@ def eval_val(h, device, val_data, model_fn):
         for i in range(num_batches):
             chunk = val_data.val_tokens[start + i*seq_len : start + (i+1)*seq_len + 1].to(device)
             x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
-            logits = model_fn(x); loss_sum += F.cross_entropy(logits.view(-1, logits.size(-1)).float(), y.view(-1), reduction='sum').item()
+            logits = model_fn(x); loss_sum += F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.view(-1), reduction='sum').item()
             tok_count += seq_len; byte_count += val_data.bytes_lut[y].sum().item()
     res = torch.tensor([loss_sum, tok_count, byte_count], device=device); dist.all_reduce(res)
     return res[0].item() / res[1].item(), (res[0].item() / math.log(2)) / res[2].item()
