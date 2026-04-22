@@ -164,6 +164,7 @@ class MHCMixer(nn.Module):
         for _ in range(self.iters):
             W = W / W.sum(dim=1, keepdim=True)
             W = W / W.sum(dim=0, keepdim=True)
+        W = W.to(streams[0].dtype)
         out = []
         for i in range(self.num_streams):
             out.append(sum(W[i, j] * streams[j] for j in range(self.num_streams)))
@@ -423,7 +424,7 @@ def collect_hessians(model, train_loader, h, device):
         if isinstance(m, CastedLinear) and m.weight.numel() > 65536: hooks.append(m.register_forward_hook(hook_fn(n + '.weight')))
     if model.h.tie_embeddings: hooks.append(model.final_norm.register_forward_hook(hook_fn('tok_emb.weight')))
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
         for _ in range(h.gptq_calibration_batches):
             x, _ = train_loader.next_batch(h.train_batch_tokens, h.grad_accum_steps); model.forward_logits(x)
     for hk in hooks: hk.remove()
