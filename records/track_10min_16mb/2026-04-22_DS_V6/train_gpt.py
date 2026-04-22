@@ -432,18 +432,21 @@ def collect_hessians(model, train_loader, h, device):
 
 def gptq_quantize(w, H, bits, sigmas):
     W, H = w.float().clone(), H.float().clone()
+    rows, cols = W.shape
     H.diagonal().add_(0.01 * H.diag().mean())
     Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
     Hinv = torch.linalg.cholesky(Hinv, upper=True)
-    scale = (sigmas * W.std(dim=1) / (2**(bits-1)-1)).clamp_min(1e-10).view(-1, 1)
-    Q = torch.zeros_like(W, dtype=torch.int8)
-    for i in range(W.shape[1]):
-        w_col = W[:, i]; d = Hinv[i, i]
-        q_col = torch.clamp(torch.round(w_col / scale.view(-1)), -2**(bits-1)+1, 2**(bits-1)-1)
-        Q[:, i] = q_col.to(torch.int8)
-        err = (w_col - q_col * scale.view(-1)) / d
-        W[:, i:] -= err.unsqueeze(1) * Hinv[i, i:].unsqueeze(0)
-    return Q, scale.view(-1).half()
+    # Per-row scaling
+    scale = (sigmas * W.std(dim=1) / (2**(bits-1)-1)).clamp_min(1e-10)
+    Q = torch.zeros((rows, cols), dtype=torch.int8, device=W.device)
+    for i in range(cols):
+        w_col = W[:, i]
+        d = Hinv[i, i]
+        q_col = torch.clamp(torch.round(w_col / scale), -2**(bits-1)+1, 2**(bits-1)-1).to(torch.int8)
+        Q[:, i].copy_(q_col)
+        err = (w_col - q_col.float() * scale) / d
+        W[:, i:] -= err.view(-1, 1) * Hinv[i, i:].view(1, -1)
+    return Q, scale.half()
 
 def serialize(h, model, code):
     sd = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -453,8 +456,15 @@ def serialize(h, model, code):
         if t.ndim == 2 and t.numel() > 65536:
             bits = h.mlp_bits if 'mlp' in n else h.matrix_bits
             cs = h.embed_clip_sigmas if 'tok_emb' in n else h.matrix_clip_sigmas
-            q, s = gptq_quantize(t, hessians[n], bits, cs)
-            quant_sd[n + '.q'], quant_sd[n + '.s'] = q, s; meta[n] = f'gptq_{bits}'
+            H = hessians.get(n)
+            if H is not None:
+                q, s = gptq_quantize(t, H, bits, cs)
+                quant_sd[n + '.q'], quant_sd[n + '.s'] = q, s; meta[n] = f'gptq_{bits}'
+            else:
+                # Fallback to standard uniform quantization
+                s = (cs * t.float().std(dim=1) / (2**(bits-1)-1)).clamp_min(1e-10)
+                q = torch.clamp(torch.round(t.float() / s.view(-1, 1)), -2**(bits-1)+1, 2**(bits-1)-1).to(torch.int8)
+                quant_sd[n + '.q'], quant_sd[n + '.s'] = q, s.half(); meta[n] = f'uniform_{bits}'
         else: quant_sd[n] = t.half(); meta[n] = 'fp16'
     buf = io.BytesIO(); torch.save({'w': quant_sd, 'm': meta}, buf)
     try: import brotli; blob = brotli.compress(buf.getvalue(), quality=11)
