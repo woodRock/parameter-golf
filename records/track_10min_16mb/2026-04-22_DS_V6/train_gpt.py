@@ -12,6 +12,10 @@ Building on DS_V5 (1.0794 BPB) with three key additions:
    the 2-matrix MLP with mlp_mult=4.0. (3 matrices * 2.68 ≈ 2 matrices * 4.0).
 
 3. Differential Attention + SmearGate: Inherited from DS_V5.
+
+Fixes:
+- DDP compatibility for forward_logits.
+- Full SOTA evaluation pipeline (Sliding Window + TTT).
 """
 import collections, copy, glob, io, lzma, math, os
 from pathlib import Path
@@ -125,6 +129,7 @@ class Hyperparameters:
     gptq_calibration_batches = int(os.environ.get('GPTQ_CALIBRATION_BATCHES', 64))
     gptq_reserve_seconds   = float(os.environ.get('GPTQ_RESERVE_SECONDS', 12.0))
     matrix_bits            = int(os.environ.get('MATRIX_BITS', 6))
+    mlp_bits               = int(os.environ.get('MLP_BITS', os.environ.get('MATRIX_BITS', 6)))
     embed_bits             = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas     = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas      = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
@@ -588,9 +593,6 @@ class GPT(nn.Module):
             h_t2 = self.mtp_proj(hidden) # aux head
             logits_t2 = F.linear(h_t2, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(h_t2)
             logits_t2 = self.logit_softcap * torch.tanh(logits_t2 / self.logit_softcap)
-            # mtp head predicts token t+2 from state at token t
-            # so logits_t2[i, t] matches target_ids[i, t+1] (which is token at t+2)
-            # but we shift the targets accordingly in the training loop.
             mtp_loss = F.cross_entropy(logits_t2[:, :-1, :].reshape(-1, logits_t2.size(-1)).float(),
                                         mtp_targets.reshape(-1), reduction='mean')
             loss = loss + Hyperparameters.mtp_lambda * mtp_loss
@@ -749,7 +751,9 @@ def gptq_mixed_quantize(state_dict, hessians, h):
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name], meta[name] = t.to(torch.float16) if t.is_floating_point() else t, 'passthrough (float16)'
             continue
-        cs, bits = (h.embed_clip_sigmas, h.embed_bits) if 'tok_emb' in name else (h.matrix_clip_sigmas, h.matrix_bits)
+        cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
+        bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
+        if 'mlp' in name: bits = h.mlp_bits
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2**(bits-1)-1)
         result[name + '.q'], result[name + '.scale'], meta[name] = q, s, f'gptq (int{bits})'
     return result, meta
@@ -789,20 +793,19 @@ def deserialize(h, device):
     eval_model.load_state_dict(dequantize_mixed(quant_state['w'], quant_state['m'], {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}))
     return eval_model
 
-def eval_val(h, device, val_data, model):
+def eval_val(h, device, val_data, model_fn):
     seq_len = h.eval_seq_len
     local_batch_seqs = (h.val_batch_tokens // (h.world_size * h.grad_accum_steps)) // seq_len
     total_seqs = (val_data.val_tokens.numel() - 1) // seq_len
     seq_start, seq_end = total_seqs * h.rank // h.world_size, total_seqs * (h.rank + 1) // h.world_size
     loss_sum, tok_count, byte_count = torch.zeros(3, device=device, dtype=torch.float64)
-    model.eval()
     with torch.inference_mode():
         for batch_start in range(seq_start, seq_end, local_batch_seqs):
             batch_end = min(batch_start + local_batch_seqs, seq_end)
             local = val_data.val_tokens[batch_start * seq_len : batch_end * seq_len + 1].to(device=device, dtype=torch.int64)
             x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits = model.forward_logits(x)
+                logits = model_fn(x)
             nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction='sum')
             loss_sum += nll.to(torch.float64); tok_count += float(y.numel())
             tb = val_data.base_bytes_lut[y.reshape(-1)].to(torch.float64)
@@ -813,11 +816,49 @@ def eval_val(h, device, val_data, model):
     val_loss = (loss_sum / tok_count).item()
     return val_loss, val_loss / math.log(2.0) * (tok_count.item() / byte_count.item())
 
+def eval_val_sliding(h, device, val_data, model_fn):
+    seq_len, stride = h.eval_seq_len, h.eval_stride
+    context_size = seq_len - stride
+    total_tokens = val_data.val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride) if ws + context_size < total_tokens]
+    total_windows = len(window_starts)
+    my_s, my_e = total_windows * h.rank // h.world_size, total_windows * (h.rank + 1) // h.world_size
+    my_windows = window_starts[my_s:my_e]
+    loss_sum, tok_count, byte_count = torch.zeros(3, device=device, dtype=torch.float64)
+    batch_seqs = 32
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch, y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device), torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens = []
+            for i, ws in enumerate(batch_ws):
+                we = min(ws + seq_len, total_tokens); wlen = we - ws; wlens.append(wlen)
+                chunk = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen], y_batch[i, :wlen] = chunk[:-1], chunk[1:]
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits = model_fn(x_batch)
+            nll_all = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y_batch.reshape(-1), reduction='none').reshape(bsz, seq_len)
+            for i, ws in enumerate(batch_ws):
+                wlen, s = wlens[i], (0 if ws == 0 else context_size)
+                scored = nll_all[i, s:wlen].to(torch.float64)
+                loss_sum += scored.sum(); tok_count += float(wlen - s)
+                tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
+                tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+                tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum); dist.all_reduce(tok_count); dist.all_reduce(byte_count)
+    val_loss = (loss_sum / tok_count).item()
+    return val_loss, val_loss / math.log(2.0) * (tok_count.item() / byte_count.item())
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train_model(h, device, val_data):
     base_model = GPT(h).to(device).bfloat16(); restore_fp32_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # Compile forward_logits for faster eval
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     model = DDP(compiled_model, device_ids=[h.local_rank]) if h.distributed else compiled_model
     optimizers = Optimizers(h, base_model); train_loader = ShuffledSequenceLoader(h, device)
     max_ms = (1e3 * h.max_wallclock_seconds - h.gptq_reserve_seconds * 1e3) if h.max_wallclock_seconds > 0 else None
@@ -851,12 +892,14 @@ def train_model(h, device, val_data):
         
         should_val = (step == h.iterations or (h.val_loss_every > 0 and step % h.val_loss_every == 0))
         if should_val:
-            val_loss, val_bpb = eval_val(h, device, val_data, model)
+            base_model.eval()
+            val_loss, val_bpb = eval_val(h, device, val_data, compiled_logits)
             log(f"{step} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
             if _wandb_run: _wandb_run.log({'val_loss': val_loss, 'val_bpb': val_bpb}, step=step)
+            base_model.train()
             if step == h.iterations: break
 
-        scale = max((1.0 - (elapsed / max_ms if max_ms else step / h.iterations)) / h.warmdown_frac, h.min_lr) if h.warmdown_frac > 0 else 1.0
+        scale = max((1.0 - (elapsed / max_ms if max_ms else step / h.iterations)) / h.warmup_steps, h.min_lr) if h.warmdown_frac > 0 else 1.0
         if h.num_loops > 0 and not base_model.looping_active and (elapsed / max_ms if max_ms else step / h.iterations) >= h.enable_looping_at:
             base_model.looping_active = True
         
@@ -881,10 +924,19 @@ def main():
     
     code = Path(__file__).read_text(encoding='utf-8')
     serialize(h, base_model, code)
+    
     eval_model = deserialize(h, device)
     if h.num_loops > 0: eval_model.looping_active = True
-    v_loss, v_bpb = eval_val(h, device, val_data, torch.compile(eval_model))
+    # Compile for evaluation
+    compiled_eval_logits = torch.compile(eval_model.forward_logits, dynamic=False, fullgraph=True)
+    
+    v_loss, v_bpb = eval_val(h, device, val_data, compiled_eval_logits)
     log(f"Final Quantized val_loss: {v_loss:.8f} val_bpb: {v_bpb:.8f}")
+    
+    if h.sliding_window_enabled:
+        v_loss, v_bpb = eval_val_sliding(h, device, val_data, compiled_eval_logits)
+        log(f"Final Sliding val_loss: {v_loss:.8f} val_bpb: {v_bpb:.8f}")
+
     if wandb_run: wandb_run.finish()
 
 if __name__ == '__main__': main()
